@@ -7,36 +7,160 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
+
+concurrency:
+  # Serialize manual + scheduled runs: each run pushes the manifest to main and
+  # mutates the single rolling release, so overlapping runs must not interleave.
+  group: threatdb-build
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  # `threatdb-latest` was sealed by GitHub release immutability and cannot be
+  # updated. Keep it intact as a legacy client fallback; all new rolling state
+  # is published through this replacement tag.
+  THREATDB_RELEASE_TAG: threatdb-current
+  THREATDB_LEGACY_RELEASE_TAG: threatdb-latest
 
 jobs:
   build-threatdb:
+    # Hard guard: this job mutates GitHub releases and pushes HEAD:main, so it
+    # must be impossible from any non-default branch (e.g. a feature-branch
+    # workflow_dispatch). schedule/dispatch always use main's copy anyway.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     env:
-      # github.run_id and github.run_attempt are GitHub-controlled numeric
-      # values, safe to use in shell commands (not user-supplied).
+      # github.run_id and github.run_attempt identify immutable asset files. They
+      # are deliberately NOT the signed database sequence: a rerun has the same
+      # run_id and an older run can be rerun after a newer one has published.
       RUN_ID: ${{ github.run_id }}
       RUN_ATTEMPT: ${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Need full history so we can rebase on top of any commits that
+          # land on main while this build is running.
+          fetch-depth: 0
+
+      # A rerun executes the workflow and compiler from its ORIGINAL GITHUB_SHA.
+      # Refuse stale source before building, fetching untrusted feeds, or exposing
+      # the signing key. The only tolerated descendants are this workflow's own
+      # direct manifest/index commits: those change publication state, not compiler
+      # code, and scheduled runs commonly start while one is at the tip.
+      - name: Refuse stale workflow reruns
+        run: |
+          set -euo pipefail
+
+          git fetch --quiet origin main
+          CURRENT_MAIN=$(git rev-parse origin/main)
+          if [ "$GITHUB_SHA" = "$CURRENT_MAIN" ]; then
+            echo "Workflow source is current at $GITHUB_SHA"
+            exit 0
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "$CURRENT_MAIN"; then
+            echo "::error::workflow source $GITHUB_SHA is not an ancestor of current main $CURRENT_MAIN; refusing stale publication"
+            exit 1
+          fi
+
+          if ! descendant_commits=$(git rev-list --reverse "$GITHUB_SHA..$CURRENT_MAIN"); then
+            echo "::error::failed to enumerate commits between workflow source and current main"
+            exit 1
+          fi
+          if [ -z "$descendant_commits" ]; then
+            echo "::error::main SHA differs but no descendant commits were found; refusing ambiguous stale publication"
+            exit 1
+          fi
+
+          while IFS= read -r commit; do
+            author_email=$(git show -s --format=%ae "$commit")
+            subject=$(git show -s --format=%s "$commit")
+            parent_count=$(git show -s --format=%P "$commit" | awk '{print NF}')
+            mapfile -t changed_paths < <(
+              git diff-tree --no-commit-id --name-only -r "$commit"
+            )
+
+            if [ "$author_email" != "41898282+github-actions[bot]@users.noreply.github.com" ] ||
+               [ "$parent_count" -ne 1 ] ||
+               [ "${#changed_paths[@]}" -ne 1 ]; then
+              echo "::error::main advanced to non-generated commit $commit; refusing stale publication"
+              exit 1
+            fi
+
+            case "${changed_paths[0]}" in
+              threatdb-manifest.json)
+                if [[ ! "$subject" =~ ^chore:\ update\ threatdb\ manifest\ to\ v[0-9]+$ ]]; then
+                  echo "::error::main advanced to unrecognized manifest commit $commit ($subject); refusing stale publication"
+                  exit 1
+                fi
+                ;;
+              threatdb-index-v2.json)
+                if [[ ! "$subject" =~ ^chore:\ update\ threatdb\ v2\ index\ to\ v[0-9]+$ ]] &&
+                   [ "$subject" != "chore: retire threatdb v2 index" ]; then
+                  echo "::error::main advanced to unrecognized v2-index commit $commit ($subject); refusing stale publication"
+                  exit 1
+                fi
+                ;;
+              *)
+                echo "::error::main advanced to unrecognized commit $commit (${changed_paths[0]}: $subject); refusing stale publication"
+                exit 1
+                ;;
+            esac
+          done <<< "$descendant_commits"
+
+          echo "Current main differs only by recognized threatdb publication commits; source remains current"
+
+      # Rollback kill-switch for the v2 channel. GitHub expression string
+      # comparisons are case-insensitive, so exact activation is normalized in
+      # Bash instead of using `vars.ENABLE_THREATDB_V2 == 'true'` in an `if`.
+      # Only the exact lowercase bytes `true` become true in GITHUB_ENV; unset,
+      # false, `TRUE`, and every other value become false. Every later shell and
+      # workflow gate consumes only this normalized value.
+      - name: Normalize fail-closed v2 activation gate
+        env:
+          REQUESTED_ENABLE_THREATDB_V2: ${{ vars.ENABLE_THREATDB_V2 }}
+        run: |
+          set -euo pipefail
+          if [ "$REQUESTED_ENABLE_THREATDB_V2" = "true" ]; then
+            NORMALIZED=true
+            echo "v2 publication explicitly enabled by exact ENABLE_THREATDB_V2=true."
+          else
+            NORMALIZED=false
+            echo "v2 publication disabled (unset, false, or non-exact repository variable)."
+          fi
+          echo "ENABLE_THREATDB_V2=$NORMALIZED" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build compiler
         run: cargo build --release -p tirith --bin tirith-threatdb-compile
 
-      # Fetch Phase A sources (parallel)
+      # Exercise the exact fetch transaction with fixture commands. A failed
+      # background child must stop the job before compilation/publication and
+      # must never expose a partial compiler-visible source set.
+      - name: Validate fail-closed source fetch orchestration
+        run: bash .github/scripts/test-fetch-threatdb-sources.sh
+
+      # Fetch Phase A sources in parallel. Each PID is waited explicitly and the
+      # complete set is published from private staging with one atomic rename.
       - name: Fetch sources
-        run: |
-          git clone --depth 1 https://github.com/ossf/malicious-packages.git /tmp/ossf-mp &
-          git clone --depth 1 https://github.com/DataDog/malicious-software-packages-dataset.git /tmp/dd-mp &
-          curl -sSfL https://feodotracker.abuse.ch/downloads/ipblocklist.txt -o /tmp/feodo.txt &
-          curl -sSfL https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json -o /tmp/cisa-kev.json &
-          wait
-          echo "Sources fetched successfully"
+        run: bash .github/scripts/fetch-threatdb-sources.sh
+
+      # DigitalSide Threat-Intel (davidonzo/Threat-Intel, MIT-licensed code) is
+      # defined in the compiler as ThreatSource::DigitalSide with a --digitalside
+      # <path> flag and a MISP-CSV parser, but the CI fetch is DELIBERATELY NOT
+      # wired up: the upstream feed is stale. Its automated daily commits stopped
+      # at 2024-10-18 and, re-checked on 2026-07-16, the repository had published
+      # nothing new since (last commit still 2024-10-18T07:09:50Z). The upstream
+      # data license/redistribution terms are also unstated in the repo README and
+      # the MISP feed metadata (distribution flag "0"), which is a second reason to
+      # hold off ingesting it into the signed DB. To re-enable once upstream is
+      # fresh AND the data license permits redistribution: fetch the MISP CSV
+      # export (e.g. the csv/ directory or a concatenated export) into /tmp, vendor
+      # the upstream LICENSE + attribution as the other feeds do, and pass
+      # `--digitalside <path>` in the "Compile threat database" step below.
 
       # Bail early if signing key is not configured
       - name: Check signing key
@@ -48,56 +172,1008 @@ jobs:
             exit 1
           fi
 
-      # Compile + sign
+      # Allocate a fresh sequence from every currently published, validly signed
+      # discovery document. github.run_id cannot be used here: reruns share it,
+      # and rerunning an older workflow after a newer run would roll the signed
+      # sequence backwards. Recomputing each deterministic Ed25519 signature with
+      # the configured key prevents an unsigned repository/release edit from
+      # influencing the sequence allocator.
+      - name: Allocate monotonic signed sequence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TIRITH_THREATDB_SIGNING_KEY: ${{ secrets.THREATDB_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+
+          STATE_DIR="$(mktemp -d)"
+          trap 'rm -rf "$STATE_DIR"' EXIT
+          MAX_SEQUENCE=0
+          BEST_V1_SEQUENCE=-1
+          BEST_V1_URL=""
+          BEST_V1_SHA=""
+          BEST_V1_SIZE=""
+          BEST_V2_SEQUENCE=-1
+          BEST_V2_URL=""
+          BEST_V2_SHA=""
+          BEST_V2_SIZE=""
+          BEST_V2_DOCUMENT=""
+          BEST_V2_PAYLOAD=""
+          rm -f -- threatdb-baseline-v2.json
+
+          consider_signed_document() {
+            local file="$1"
+            local kind="$2"
+            local label="$3"
+            local payload signature expected sequence manifest_version
+            local v1_url v1_sha v1_size v2_url v2_sha v2_size
+
+            case "$kind" in
+              manifest)
+                jq -e '
+                  (.version | type == "number" and floor == . and . >= 0) and
+                  (.sha256 | type == "string") and
+                  (.size | type == "number" and floor == . and . >= 0) and
+                  (.url | type == "string") and
+                  (.signature | type == "string")
+                ' "$file" >/dev/null
+                payload=$(jq -cS '{sha256, size, url, version}' "$file")
+                sequence=$(jq -er '.version' "$file")
+                v1_url=$(jq -er '.url' "$file")
+                v1_sha=$(jq -er '.sha256' "$file")
+                v1_size=$(jq -er '.size' "$file")
+                ;;
+              index)
+                jq -e '
+                  (.manifest_version == 1 or .manifest_version == 2) and
+                  (.sequence | type == "number" and floor == . and . >= 0) and
+                  (.assets | type == "array" and length == 2) and
+                  ([.assets[] | select(.format == 1)] | length == 1) and
+                  ([.assets[] | select(.format == 2)] | length == 1) and
+                  ([.assets[].filename] | unique | length == 2) and
+                  ([.assets[].url] | unique | length == 2) and
+                  (all(.assets[];
+                    (.filename | type == "string") and
+                    (.url | type == "string") and
+                    (.sha256 | type == "string" and test("^[0-9A-Fa-f]{64}$")) and
+                    (.size | type == "number" and floor == . and . > 0))) and
+                  (.signature | type == "string")
+                ' "$file" >/dev/null
+                manifest_version=$(jq -er '.manifest_version' "$file")
+                case "$manifest_version" in
+                  # Read-only migration bridge: schema v1 indexes may already be
+                  # published and signed without manifest_version. They can seed
+                  # the monotonic allocator once, but every new publication below
+                  # is schema v2 and signs the version.
+                  1) payload=$(jq -cS 'del(.manifest_version, .signature)' "$file") ;;
+                  2) payload=$(jq -cS 'del(.signature)' "$file") ;;
+                  *)
+                    echo "::error::$label has unsupported manifest_version $manifest_version"
+                    exit 1
+                    ;;
+                esac
+                sequence=$(jq -er '.sequence' "$file")
+                v1_url=$(jq -er '.assets[] | select(.format == 1) | .url' "$file")
+                v1_sha=$(jq -er '.assets[] | select(.format == 1) | .sha256' "$file")
+                v1_size=$(jq -er '.assets[] | select(.format == 1) | .size' "$file")
+                v2_url=$(jq -er '.assets[] | select(.format == 2) | .url' "$file")
+                v2_sha=$(jq -er '.assets[] | select(.format == 2) | .sha256' "$file")
+                v2_size=$(jq -er '.assets[] | select(.format == 2) | .size' "$file")
+                ;;
+              *)
+                echo "::error::unknown discovery-document kind: $kind"
+                exit 1
+                ;;
+            esac
+
+            # jq represents JSON numbers exactly only through 2^53-1. Keeping
+            # the allocator below that ceiling prevents a signed literal from
+            # being rounded while its canonical payload is reconstructed.
+            if [[ ! "$sequence" =~ ^[0-9]+$ ]] ||
+               (( 10#$sequence > 9007199254740990 )); then
+              echo "::error::$label has an unsafe sequence: $sequence"
+              exit 1
+            fi
+
+            signature=$(jq -er '.signature' "$file")
+            expected=$(./target/release/tirith-threatdb-compile sign-payload \
+              --payload "$payload" --key-env TIRITH_THREATDB_SIGNING_KEY)
+            if [ "$signature" != "$expected" ]; then
+              echo "::error::$label has an invalid signature; refusing to allocate a sequence"
+              exit 1
+            fi
+
+            if (( 10#$sequence > MAX_SEQUENCE )); then
+              MAX_SEQUENCE=$((10#$sequence))
+            fi
+            if (( 10#$sequence > BEST_V1_SEQUENCE )); then
+              BEST_V1_SEQUENCE=$((10#$sequence))
+              BEST_V1_URL=$v1_url
+              BEST_V1_SHA=$v1_sha
+              BEST_V1_SIZE=$v1_size
+            fi
+            if [ "$kind" = "index" ]; then
+              if (( 10#$sequence > BEST_V2_SEQUENCE )); then
+                BEST_V2_SEQUENCE=$((10#$sequence))
+                BEST_V2_URL=$v2_url
+                BEST_V2_SHA=$v2_sha
+                BEST_V2_SIZE=$v2_size
+                BEST_V2_DOCUMENT=$file
+                BEST_V2_PAYLOAD=$payload
+              elif (( 10#$sequence == BEST_V2_SEQUENCE )) &&
+                   [ "$payload" != "$BEST_V2_PAYLOAD" ]; then
+                echo "::error::signed v2 documents equivocate at sequence $sequence"
+                exit 1
+              fi
+            fi
+            echo "Accepted $label sequence $sequence"
+          }
+
+          # The checkout may be the original commit of an older rerun, so always
+          # inspect the current main branch explicitly rather than the worktree.
+          git fetch --quiet origin main
+          if git show origin/main:threatdb-manifest.json \
+              > "$STATE_DIR/main-manifest.json" 2>/dev/null; then
+            consider_signed_document \
+              "$STATE_DIR/main-manifest.json" manifest "main manifest"
+          fi
+          if git show origin/main:threatdb-index-v2.json \
+              > "$STATE_DIR/main-index.json" 2>/dev/null; then
+            consider_signed_document \
+              "$STATE_DIR/main-index.json" index "main v2 index"
+          fi
+
+          # The rolling release is a second publication surface. It can be ahead
+          # of main after a push failure, so both copies participate in the max.
+          # On the first run after the immutable-release migration, bootstrap
+          # only from the sealed legacy channel. Once the replacement exists,
+          # every later run must allocate from it.
+          ROLLING_STATE_TAG="$THREATDB_RELEASE_TAG"
+          if ! gh release view "$ROLLING_STATE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --json assets > "$STATE_DIR/release.json"; then
+            if git ls-remote --exit-code --tags origin \
+                "refs/tags/$THREATDB_RELEASE_TAG" >/dev/null 2>&1; then
+              echo "::error::$THREATDB_RELEASE_TAG tag exists but its release could not be inspected; refusing legacy bootstrap"
+              exit 1
+            fi
+            ROLLING_STATE_TAG="$THREATDB_LEGACY_RELEASE_TAG"
+            if ! gh release view "$ROLLING_STATE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --json assets > "$STATE_DIR/release.json"; then
+              echo "::error::failed to inspect either rolling release; refusing to allocate from incomplete state"
+              exit 1
+            fi
+            echo "Bootstrapping $THREATDB_RELEASE_TAG from sealed $ROLLING_STATE_TAG"
+          fi
+
+          if [ -s "$STATE_DIR/release.json" ]; then
+            if ! jq -e '.assets | any(.name == "threatdb-manifest.json")' \
+                "$STATE_DIR/release.json" >/dev/null; then
+              echo "::error::rolling release exists without threatdb-manifest.json"
+              exit 1
+            fi
+            mkdir -p "$STATE_DIR/release"
+            gh release download "$ROLLING_STATE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern threatdb-manifest.json --dir "$STATE_DIR/release" --clobber
+            consider_signed_document \
+              "$STATE_DIR/release/threatdb-manifest.json" manifest \
+              "rolling-release manifest"
+
+            if jq -e '.assets | any(.name == "threatdb-index-v2.json")' \
+                "$STATE_DIR/release.json" >/dev/null; then
+              gh release download "$ROLLING_STATE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --pattern threatdb-index-v2.json --dir "$STATE_DIR/release" --clobber
+              consider_signed_document \
+                "$STATE_DIR/release/threatdb-index-v2.json" index \
+                "rolling-release v2 index"
+            fi
+            if jq -e '.assets | any(.name == "threatdb-baseline-v2.json")' \
+                "$STATE_DIR/release.json" >/dev/null; then
+              gh release download "$ROLLING_STATE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --pattern threatdb-baseline-v2.json --dir "$STATE_DIR/release" --clobber
+              consider_signed_document \
+                "$STATE_DIR/release/threatdb-baseline-v2.json" index \
+                "retained non-discovery v2 baseline"
+            fi
+          fi
+
+          NOW_MILLIS=$(date +%s%3N)
+          if [[ ! "$NOW_MILLIS" =~ ^[0-9]+$ ]]; then
+            echo "::error::failed to obtain an integer millisecond timestamp"
+            exit 1
+          fi
+          BUILD_SEQUENCE=$NOW_MILLIS
+          if (( BUILD_SEQUENCE <= MAX_SEQUENCE )); then
+            BUILD_SEQUENCE=$((MAX_SEQUENCE + 1))
+          fi
+          if (( BUILD_SEQUENCE <= MAX_SEQUENCE )); then
+            echo "::error::failed to allocate a sequence above $MAX_SEQUENCE"
+            exit 1
+          fi
+          echo "Allocated signed sequence $BUILD_SEQUENCE (previous max $MAX_SEQUENCE)"
+          echo "BUILD_SEQUENCE=$BUILD_SEQUENCE" >> "$GITHUB_ENV"
+
+          # Materialize stable, signed-generation baselines independently of the
+          # new run-scoped output filenames. This directory must survive later
+          # workflow steps, unlike STATE_DIR (which is removed by the EXIT trap).
+          # The compiler re-verifies each DB's embedded signature and sequence
+          # before applying section-aware floors.
+          PUBLISH_STATE_DIR=$(mktemp -d "${RUNNER_TEMP}/tirith-threatdb-publish.XXXXXX")
+          chmod 700 "$PUBLISH_STATE_DIR"
+          echo "THREATDB_PUBLISH_STATE_DIR=$PUBLISH_STATE_DIR" >> "$GITHUB_ENV"
+          BASELINE_DIR="$PUBLISH_STATE_DIR/baseline"
+          mkdir -p "$BASELINE_DIR"
+          if (( BEST_V2_SEQUENCE >= 0 )); then
+            # Public, signed, non-discovery state. This survives disabling and
+            # deleting both client-facing indexes so a later reactivation still
+            # has an authenticated v2 anti-drop baseline.
+            cp -- "$BEST_V2_DOCUMENT" threatdb-baseline-v2.json
+          fi
+          download_baseline() {
+            local label="$1" url="$2" expected_sha="$3" expected_size="$4" output="$5"
+            curl -sSfL --retry 3 --retry-all-errors "$url" -o "$output"
+            local actual_sha actual_size
+            actual_sha=$(sha256sum "$output" | cut -d' ' -f1)
+            actual_size=$(stat -c%s "$output")
+            if [ "$actual_sha" != "$expected_sha" ] || [ "$actual_size" != "$expected_size" ]; then
+              echo "::error::$label baseline bytes do not match the signed discovery document"
+              exit 1
+            fi
+          }
+          if (( BEST_V1_SEQUENCE >= 0 )); then
+            download_baseline "v1" "$BEST_V1_URL" "$BEST_V1_SHA" "$BEST_V1_SIZE" "$BASELINE_DIR/v1.dat"
+            echo "BASELINE_V1_PATH=$BASELINE_DIR/v1.dat" >> "$GITHUB_ENV"
+          fi
+          if [ "${ENABLE_THREATDB_V2}" = "true" ] && (( BEST_V2_SEQUENCE >= 0 )); then
+            download_baseline "v2" "$BEST_V2_URL" "$BEST_V2_SHA" "$BEST_V2_SIZE" "$BASELINE_DIR/v2.dat"
+            echo "BASELINE_V2_PATH=$BASELINE_DIR/v2.dat" >> "$GITHUB_ENV"
+          fi
+
+      # Optional: materialize the curated exfil-endpoint / webhook-catcher
+      # hostname list from a repo secret. No real list ships in-tree; when the
+      # THREATDB_EXFIL_ENDPOINTS secret is unset the build simply skips the feed.
+      - name: Materialize exfil-endpoint feed
+        env:
+          THREATDB_EXFIL_ENDPOINTS: ${{ secrets.THREATDB_EXFIL_ENDPOINTS }}
+        run: |
+          set -euo pipefail
+          if [ -n "$THREATDB_EXFIL_ENDPOINTS" ]; then
+            umask 077
+            EXFIL_ENDPOINTS_PATH="$THREATDB_PUBLISH_STATE_DIR/exfil-endpoints.txt"
+            printf '%s\n' "$THREATDB_EXFIL_ENDPOINTS" > "$EXFIL_ENDPOINTS_PATH"
+            echo "EXFIL_ENDPOINTS_PATH=$EXFIL_ENDPOINTS_PATH" >> "$GITHUB_ENV"
+            echo "Exfil-endpoint feed provided ($(grep -cve '^\s*#' -e '^\s*$' "$EXFIL_ENDPOINTS_PATH") entries)."
+          else
+            echo "No exfil-endpoint secret set; skipping the feed."
+          fi
+
+      # Compile + sign. Emits BOTH formats from one run: the v1 asset (--output,
+      # unchanged, served to old clients via the legacy manifest) and the v2
+      # asset (--output-v2, the same base data plus artifact-SHA, file-SHA, and
+      # malicious-URL sections, served to v2-capable clients via the v2 index).
       - name: Compile threat database
         env:
           TIRITH_THREATDB_SIGNING_KEY: ${{ secrets.THREATDB_SIGNING_KEY }}
         run: |
+          set -euo pipefail
+          # Pass --exfil-endpoints only when the optional feed was materialized.
+          EXFIL_ARGS=()
+          if [ -n "${EXFIL_ENDPOINTS_PATH:-}" ] && [ -f "$EXFIL_ENDPOINTS_PATH" ]; then
+            EXFIL_ARGS+=(--exfil-endpoints "$EXFIL_ENDPOINTS_PATH")
+          fi
+          # Compile the v2 asset ONLY when ENABLE_THREATDB_V2 is on. With the kill switch
+          # off this remains a v1-only run and every later v2 step is skipped. With
+          # it on, both formats and their generation pointer are one validated
+          # compiler transaction; a failure aborts before anything is published.
+          V2_ARGS=()
+          GENERATION_ARGS=()
+          if [ "${ENABLE_THREATDB_V2}" = "true" ]; then
+            V2_ARGS+=(--output-v2 "tirith-threatdb-v2-${RUN_ID}-${RUN_ATTEMPT}.dat")
+            GENERATION_ARGS+=(
+              --generation-manifest threatdb-index-v2.json
+              --generation-base-url "https://github.com/sheeki03/tirith/releases/download/${THREATDB_RELEASE_TAG}"
+              --source-integrity-manifest "threatdb-source-integrity-${RUN_ID}-${RUN_ATTEMPT}.json"
+            )
+          fi
+          BASELINE_ARGS=()
+          if [ -n "${BASELINE_V1_PATH:-}" ]; then
+            BASELINE_ARGS+=(--baseline-v1 "$BASELINE_V1_PATH")
+          fi
+          if [ "${ENABLE_THREATDB_V2}" = "true" ] &&
+             [ -f threatdb-baseline-v2.json ] &&
+             [ -z "${BASELINE_V2_PATH:-}" ]; then
+            echo "::error::authenticated retained v2 baseline exists but was not materialized; refusing baseline-free reactivation"
+            exit 1
+          fi
+          if [ "${ENABLE_THREATDB_V2}" = "true" ] && [ -n "${BASELINE_V2_PATH:-}" ]; then
+            BASELINE_ARGS+=(--baseline-v2 "$BASELINE_V2_PATH")
+          fi
+          SOURCE_PROVENANCE="threatdb-source-provenance-${RUN_ID}-${RUN_ATTEMPT}.json"
+          RAW_SOURCE_PROVENANCE=/tmp/tirith-threatdb-sources/source-provenance.json
+          COMPILER_METADATA="threatdb-compiler-metadata-${RUN_ID}-${RUN_ATTEMPT}.json"
+          jq -e \
+            '(.schema_version == 2) and
+             (.compiler_version | type == "string") and
+             (.retrieved_at | type == "string") and
+             (.ossf_malicious_packages.commit | test("^[0-9a-f]{40}$")) and
+             (.datadog_malicious_software_packages.commit | test("^[0-9a-f]{40}$")) and
+             (.ecosystems_typosquatting_dataset.commit | test("^[0-9a-f]{40}$")) and
+             (.registry_version_snapshot.sha256 | test("^[0-9a-f]{64}$"))' \
+            "$RAW_SOURCE_PROVENANCE" >/dev/null
           ./target/release/tirith-threatdb-compile \
-            --ossf /tmp/ossf-mp \
-            --datadog /tmp/dd-mp \
-            --feodo /tmp/feodo.txt \
-            --cisa-kev /tmp/cisa-kev.json \
-            --sequence "${RUN_ID}" \
+            --ossf /tmp/tirith-threatdb-sources/ossf-mp \
+            --registry-snapshots /tmp/tirith-threatdb-sources/registry-versions.json \
+            --source-provenance "$RAW_SOURCE_PROVENANCE" \
+            --compiler-metadata "$COMPILER_METADATA" \
+            --datadog /tmp/tirith-threatdb-sources/dd-mp \
+            --feodo /tmp/tirith-threatdb-sources/feodo.txt \
+            --cisa-kev /tmp/tirith-threatdb-sources/cisa-kev.json \
+            --typosquats /tmp/tirith-threatdb-sources/typosquats/typosquats.csv \
+            "${EXFIL_ARGS[@]}" \
+            --sequence "${BUILD_SEQUENCE}" \
             --sign-key-env TIRITH_THREATDB_SIGNING_KEY \
-            --output tirith-threatdb.dat
+            --output "tirith-threatdb-${RUN_ID}-${RUN_ATTEMPT}.dat" \
+            "${BASELINE_ARGS[@]}" \
+            "${V2_ARGS[@]}" \
+            "${GENERATION_ARGS[@]}"
+
+          SOURCE_TRANSACTION_SHA=$(sha256sum "$RAW_SOURCE_PROVENANCE" | cut -d' ' -f1)
+          COMPILER_METADATA_SHA=$(sha256sum "$COMPILER_METADATA" | cut -d' ' -f1)
+          REGISTRY_SNAPSHOT_SHA=$(jq -er '.registry_version_snapshot.sha256' "$RAW_SOURCE_PROVENANCE")
+          SOURCE_INTEGRITY_MANIFEST="threatdb-source-integrity-${RUN_ID}-${RUN_ATTEMPT}.json"
+          SOURCE_INTEGRITY_MANIFEST_SHA=""
+          if [ "${ENABLE_THREATDB_V2}" = "true" ]; then
+            SOURCE_INTEGRITY_MANIFEST_SHA=$(sha256sum "$SOURCE_INTEGRITY_MANIFEST" | cut -d' ' -f1)
+          fi
+          jq -n \
+            --slurpfile source "$RAW_SOURCE_PROVENANCE" \
+            --slurpfile compiler "$COMPILER_METADATA" \
+            --arg source_sha "$SOURCE_TRANSACTION_SHA" \
+            --arg compiler_sha "$COMPILER_METADATA_SHA" \
+            --arg registry_sha "$REGISTRY_SNAPSHOT_SHA" \
+            --arg integrity_manifest_sha "$SOURCE_INTEGRITY_MANIFEST_SHA" \
+            '$source[0] + {
+              compiler_parse: $compiler[0],
+              integrity_bindings: {
+                source_transaction_sha256: $source_sha,
+                registry_snapshot_sha256: $registry_sha,
+                compiler_metadata_sha256: $compiler_sha,
+                source_integrity_manifest_sha256: $integrity_manifest_sha
+              }
+            }' > "$SOURCE_PROVENANCE"
+          jq -e \
+            --arg source_sha "$SOURCE_TRANSACTION_SHA" \
+            --arg compiler_sha "$COMPILER_METADATA_SHA" \
+            --arg registry_sha "$REGISTRY_SNAPSHOT_SHA" \
+            --arg integrity_manifest_sha "$SOURCE_INTEGRITY_MANIFEST_SHA" \
+            '(.schema_version == 2) and
+             (.compiler_parse.schema_version == 1) and
+             (.compiler_parse.compiler_version == .compiler_version) and
+             (.compiler_parse.sources.ossf_malicious_packages.accepted | type == "number") and
+             (.compiler_parse.sources.ossf_malicious_packages.rejected | type == "number") and
+             (.compiler_parse.sources.datadog_malicious_software_packages.accepted | type == "number") and
+             (.compiler_parse.sources.ecosystems_typosquatting_dataset.accepted | type == "number") and
+             (.integrity_bindings.source_transaction_sha256 == $source_sha) and
+             (.integrity_bindings.registry_snapshot_sha256 == $registry_sha) and
+             (.integrity_bindings.compiler_metadata_sha256 == $compiler_sha) and
+             (.integrity_bindings.source_integrity_manifest_sha256 == $integrity_manifest_sha) and
+             (.compiler_parse.source_transaction_sha256 == $source_sha) and
+             (.compiler_parse.registry_snapshot_sha256 == $registry_sha)' \
+            "$SOURCE_PROVENANCE" >/dev/null
+          RECONSTRUCTED_SOURCE_SHA=$(
+            jq -cS 'del(.compiler_parse, .integrity_bindings)' "$SOURCE_PROVENANCE" \
+              | sha256sum | cut -d' ' -f1
+          )
+          RECONSTRUCTED_COMPILER_SHA=$(
+            printf '%s' "$(jq -cS '.compiler_parse' "$SOURCE_PROVENANCE")" \
+              | sha256sum | cut -d' ' -f1
+          )
+          if [ "$RECONSTRUCTED_SOURCE_SHA" != "$SOURCE_TRANSACTION_SHA" ] ||
+             [ "$RECONSTRUCTED_COMPILER_SHA" != "$COMPILER_METADATA_SHA" ]; then
+            echo "::error::merged release provenance cannot reconstruct its bound source/compiler metadata digests"
+            exit 1
+          fi
+
+      - name: Remove compiler input state
+        if: ${{ always() }}
+        env:
+          PERSISTED_STATE_DIR: ${{ env.THREATDB_PUBLISH_STATE_DIR }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PERSISTED_STATE_DIR:-}" ]; then
+            exit 0
+          fi
+          case "$PERSISTED_STATE_DIR" in
+            "$RUNNER_TEMP"/tirith-threatdb-publish.*) ;;
+            *)
+              echo "::error::refusing to remove unexpected publication state path"
+              exit 1
+              ;;
+          esac
+          rm -rf -- "$PERSISTED_STATE_DIR"
 
       # Generate + sign manifest for client discovery
       - name: Generate signed manifest
         env:
           TIRITH_THREATDB_SIGNING_KEY: ${{ secrets.THREATDB_SIGNING_KEY }}
         run: |
-          SHA=$(sha256sum tirith-threatdb.dat | cut -d' ' -f1)
-          SIZE=$(stat -c%s tirith-threatdb.dat)
-          URL="https://github.com/sheeki03/tirith/releases/download/threatdb-${RUN_ID}-${RUN_ATTEMPT}/tirith-threatdb.dat"
-          PAYLOAD="{\"sha256\":\"$SHA\",\"size\":$SIZE,\"url\":\"$URL\",\"version\":${RUN_ID}}"
+          set -euo pipefail
+          DB_ASSET="tirith-threatdb-${RUN_ID}-${RUN_ATTEMPT}.dat"
+          SHA=$(sha256sum "$DB_ASSET" | cut -d' ' -f1)
+          SIZE=$(stat -c%s "$DB_ASSET")
+          URL="https://github.com/sheeki03/tirith/releases/download/${THREATDB_RELEASE_TAG}/${DB_ASSET}"
+          # PAYLOAD MUST stay byte-identical to the client's canonical_payload() in
+          # crates/tirith/src/cli/threatdb_cmd.rs (alphabetical keys, compact, no
+          # spaces) — only the $URL value differs from older versions. The signature
+          # is over these literal bytes; a stray space breaks every client. Guarded
+          # by the canonical_payload_* unit tests and the self-check below.
+          PAYLOAD="{\"sha256\":\"$SHA\",\"size\":$SIZE,\"url\":\"$URL\",\"version\":${BUILD_SEQUENCE}}"
+          CANON=$(printf '%s' "$PAYLOAD" | jq -cS .)
+          if [ "$PAYLOAD" != "$CANON" ]; then
+            echo "::error::PAYLOAD is not in canonical form. got=$PAYLOAD want=$CANON"
+            exit 1
+          fi
           SIG=$(./target/release/tirith-threatdb-compile sign-payload \
             --payload "$PAYLOAD" --key-env TIRITH_THREATDB_SIGNING_KEY)
           cat > threatdb-manifest.json <<EEOF
-          {"version":${RUN_ID},"sha256":"$SHA","size":$SIZE,"url":"$URL","signature":"$SIG"}
+          {"version":${BUILD_SEQUENCE},"sha256":"$SHA","size":$SIZE,"url":"$URL","signature":"$SIG"}
           EEOF
 
-      # Publish DB as release
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
+      # The v1 asset + legacy manifest publish UNCONDITIONALLY and BEFORE the
+      # compiler-generated v2 index is independently validated/published. Thus a
+      # later v2-side failure (the version-tag preflight or an index validation
+      # error) cannot skip the v1 publish that old clients depend on.
+      - name: Publish release (v1 + legacy manifest)
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          tag_name: threatdb-${{ github.run_id }}-${{ github.run_attempt }}
+          tag_name: ${{ env.THREATDB_RELEASE_TAG }}
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          name: "Threat DB (rolling)"
+          body: "Auto-updated threat-intelligence database (prerelease channel). Not a versioned download; tirith resolves it via the signed manifest. See #140."
           files: |
-            tirith-threatdb.dat
+            tirith-threatdb-${{ github.run_id }}-${{ github.run_attempt }}.dat
+            threatdb-source-provenance-${{ github.run_id }}-${{ github.run_attempt }}.json
             threatdb-manifest.json
 
-      # Update manifest on main branch via PR (avoids direct push permission issues)
-      - name: Update manifest
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Commit the legacy manifest's raw `main` copy UNCONDITIONALLY and BEFORE the v2
+      # index is generated: this raw file is the v1 client's PRIMARY discovery URL, so a
+      # later v2-side failure must never skip it (which would strand v1 clients on a
+      # stale manifest pointing at a since-pruned asset).
+      - name: Commit v1 manifest to main
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          BRANCH="threatdb-manifest-${RUN_ID}-${RUN_ATTEMPT}"
-          git checkout -b "$BRANCH"
           git add threatdb-manifest.json
-          git commit -m "chore: update threatdb manifest to v${RUN_ID}"
-          git push -u origin "$BRANCH"
-          gh pr create --title "chore: threatdb manifest v${RUN_ID}" \
-            --body "Auto-generated by threatdb CI" --label bot
-          gh pr merge --auto --squash || echo "::warning::Auto-merge failed. Manifest PR needs manual merge."
+          if git diff --cached --quiet; then
+            echo "Manifest unchanged; nothing to commit."
+            exit 0
+          fi
+          git commit -m "chore: update threatdb manifest to v${BUILD_SEQUENCE}"
+          # Absorb any commits that landed on main during the build, then push.
+          git pull --rebase --autostash origin main
+          git push origin HEAD:main
+
+      # Disabling v2 retires BOTH discovery pointers before pruning can remove
+      # any referenced immutable data. Removing only the main copy would leave
+      # clients on the rolling-release fallback; removing data first would leave
+      # prune and clients following a dangling signed pointer.
+      - name: Retire rolling-release v2 index when disabled
+        if: ${{ env.ENABLE_THREATDB_V2 != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          STATE_DIR=$(mktemp -d)
+          trap 'rm -rf "$STATE_DIR"' EXIT
+          if ! gh release view "$THREATDB_RELEASE_TAG" --repo "${{ github.repository }}" \
+              --json assets > "$STATE_DIR/assets.json"; then
+            echo "::error::cannot inspect rolling release before v2-index retirement"
+            exit 1
+          fi
+          if [ -f threatdb-baseline-v2.json ]; then
+            gh release upload "$THREATDB_RELEASE_TAG" threatdb-baseline-v2.json \
+              --repo "${{ github.repository }}" --clobber
+            if ! gh release view "$THREATDB_RELEASE_TAG" --repo "${{ github.repository }}" \
+                --json assets > "$STATE_DIR/assets-with-baseline.json"; then
+              echo "::error::cannot verify retained v2 baseline publication"
+              exit 1
+            fi
+            if ! jq -e '.assets | any(.name == "threatdb-baseline-v2.json")' \
+                "$STATE_DIR/assets-with-baseline.json" >/dev/null; then
+              echo "::error::retained v2 baseline is absent; refusing discovery-pointer deletion"
+              exit 1
+            fi
+            mkdir -p "$STATE_DIR/verify-baseline"
+            if ! gh release download "$THREATDB_RELEASE_TAG" --repo "${{ github.repository }}" \
+                --pattern threatdb-baseline-v2.json \
+                --dir "$STATE_DIR/verify-baseline" --clobber; then
+              echo "::error::cannot read back retained v2 baseline"
+              exit 1
+            fi
+            if ! cmp -s threatdb-baseline-v2.json \
+                "$STATE_DIR/verify-baseline/threatdb-baseline-v2.json"; then
+              echo "::error::retained v2 baseline read-back differs; refusing discovery-pointer deletion"
+              exit 1
+            fi
+          fi
+          if jq -e '.assets | any(.name == "threatdb-index-v2.json")' \
+              "$STATE_DIR/assets.json" >/dev/null; then
+            gh release delete-asset "$THREATDB_RELEASE_TAG" threatdb-index-v2.json \
+              --repo "${{ github.repository }}" --yes
+            if ! gh release view "$THREATDB_RELEASE_TAG" --repo "${{ github.repository }}" \
+                --json assets > "$STATE_DIR/assets-after.json"; then
+              echo "::error::cannot verify rolling-release v2-index retirement"
+              exit 1
+            fi
+            if jq -e '.assets | any(.name == "threatdb-index-v2.json")' \
+                "$STATE_DIR/assets-after.json" >/dev/null; then
+              echo "::error::rolling-release v2 discovery pointer still exists after deletion"
+              exit 1
+            fi
+            echo "Retired rolling-release v2 discovery pointer."
+          else
+            echo "Rolling-release v2 discovery pointer is already retired."
+          fi
+
+      - name: Retire main v2 index when disabled
+        if: ${{ env.ENABLE_THREATDB_V2 != 'true' }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase --autostash origin main
+          if ! git ls-files --error-unmatch threatdb-index-v2.json >/dev/null 2>&1; then
+            echo "Main v2 discovery pointer is already retired."
+            exit 0
+          fi
+          git rm threatdb-index-v2.json
+          git commit -m "chore: retire threatdb v2 index"
+          git push origin HEAD:main
+          git fetch --quiet origin main
+          if git cat-file -e origin/main:threatdb-index-v2.json 2>/dev/null; then
+            echo "::error::main v2 discovery pointer still exists after retirement push"
+            exit 1
+          fi
+
+      # Validate the compiler-signed multi-asset generation index for v2-capable
+      # client discovery.
+      # ADDITIVE: the legacy manifest above is untouched and keeps pointing at v1;
+      # old clients only ever read it. New clients read this index, verify its
+      # signature, and select the highest compatible asset (here v2), falling back
+      # to the legacy manifest on any failure.
+      - name: Validate compiler-generated signed generation index
+        # Gated by the ENABLE_THREATDB_V2 rollback switch (DB-C runbook). When false, the
+        # v2 index is not (re)generated; the v1 asset + legacy manifest below are
+        # untouched and still publish, so old clients keep updating.
+        if: ${{ env.ENABLE_THREATDB_V2 == 'true' }}
+        env:
+          TIRITH_THREATDB_SIGNING_KEY: ${{ secrets.THREATDB_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          V1_ASSET="tirith-threatdb-${RUN_ID}-${RUN_ATTEMPT}.dat"
+          V2_ASSET="tirith-threatdb-v2-${RUN_ID}-${RUN_ATTEMPT}.dat"
+          V1_SHA=$(sha256sum "$V1_ASSET" | cut -d' ' -f1)
+          V2_SHA=$(sha256sum "$V2_ASSET" | cut -d' ' -f1)
+          V1_SIZE=$(stat -c%s "$V1_ASSET")
+          V2_SIZE=$(stat -c%s "$V2_ASSET")
+          V1_URL="https://github.com/sheeki03/tirith/releases/download/${THREATDB_RELEASE_TAG}/${V1_ASSET}"
+          V2_URL="https://github.com/sheeki03/tirith/releases/download/${THREATDB_RELEASE_TAG}/${V2_ASSET}"
+          SOURCE_PROVENANCE="threatdb-source-provenance-${RUN_ID}-${RUN_ATTEMPT}.json"
+          SOURCE_TRANSACTION_SHA=$(jq -er '.integrity_bindings.source_transaction_sha256' "$SOURCE_PROVENANCE")
+          REGISTRY_SNAPSHOT_SHA=$(jq -er '.integrity_bindings.registry_snapshot_sha256' "$SOURCE_PROVENANCE")
+          COMPILER_METADATA_SHA=$(jq -er '.integrity_bindings.compiler_metadata_sha256' "$SOURCE_PROVENANCE")
+          # The minimum Tirith version that ships the v2-capable reader. A client
+          # older than this skips the v2 asset and stays on v1 via the legacy
+          # manifest. This is the floor introduced with DB-B/DB-C. It MUST equal
+          # the tag of the release that first ships the DB-B reader: a client at
+          # exactly v${V2_MIN_VERSION} is expected to be able to read the v2 asset.
+          V2_MIN_VERSION="0.4.0"
+
+          # Pre-flight: refuse to publish a v2 index whose min_tirith_version
+          # points at a release tag that does not exist. Without this a typo (or a
+          # not-yet-cut release) would gate the v2 asset behind a floor no client
+          # can ever satisfy, silently keeping the whole fleet on v1. Tags are not
+          # guaranteed to be present even with fetch-depth: 0, so fetch them first.
+          git fetch --tags --quiet
+          if ! git tag -l "v${V2_MIN_VERSION}" | grep -q .; then
+            echo "::error::V2_MIN_VERSION=${V2_MIN_VERSION} has no matching release tag v${V2_MIN_VERSION}. Refusing to publish a v2 index gated behind a nonexistent release."
+            exit 1
+          fi
+
+          # The compiler staged and signed this complete two-asset generation from
+          # the exact DB bytes, then published the pointer last. Reconstruct its
+          # canonical signed region independently and verify the signature with
+          # the configured production key before any release/main publication.
+          PAYLOAD=$(jq -cS 'del(.signature)' threatdb-index-v2.json)
+          SIG=$(jq -er '.signature' threatdb-index-v2.json)
+          EXPECTED_SIG=$(./target/release/tirith-threatdb-compile sign-payload \
+            --payload "$PAYLOAD" --key-env TIRITH_THREATDB_SIGNING_KEY)
+          if [ "$SIG" != "$EXPECTED_SIG" ]; then
+            echo "::error::compiler-generated generation manifest has an invalid signature"
+            exit 1
+          fi
+          jq -e \
+            --argjson sequence "${BUILD_SEQUENCE}" \
+            --arg v1 "$V1_ASSET" \
+            --arg v2 "$V2_ASSET" \
+            --arg v1_url "$V1_URL" \
+            --arg v2_url "$V2_URL" \
+            --arg min "$V2_MIN_VERSION" \
+            '(.manifest_version == 2) and (.sequence == $sequence) and
+             ((keys | sort) == ["assets", "manifest_version", "sequence", "signature"]) and
+             (.assets | length == 2) and
+             ([.assets[].filename] | unique | length == 2) and
+             ([.assets[].url] | unique | length == 2) and
+             ([.assets[] | select(.format == 1 and .filename == $v1 and .url == $v1_url and (.min_tirith_version | not))] | length == 1) and
+             ([.assets[] | select(.format == 2 and .filename == $v2 and .url == $v2_url and .min_tirith_version == $min)] | length == 1)' \
+            threatdb-index-v2.json >/dev/null
+
+          SOURCE_INTEGRITY="threatdb-source-integrity-${RUN_ID}-${RUN_ATTEMPT}.json"
+          INTEGRITY_PAYLOAD=$(jq -cS 'del(.signature)' "$SOURCE_INTEGRITY")
+          INTEGRITY_SIG=$(jq -er '.signature' "$SOURCE_INTEGRITY")
+          EXPECTED_INTEGRITY_SIG=$(./target/release/tirith-threatdb-compile sign-payload \
+            --payload "$INTEGRITY_PAYLOAD" --key-env TIRITH_THREATDB_SIGNING_KEY)
+          if [ "$INTEGRITY_SIG" != "$EXPECTED_INTEGRITY_SIG" ]; then
+            echo "::error::source-integrity sidecar has an invalid signature"
+            exit 1
+          fi
+          SOURCE_TRANSACTION_SHA=$(jq -er '.integrity_bindings.source_transaction_sha256' "$SOURCE_PROVENANCE")
+          REGISTRY_SNAPSHOT_SHA=$(jq -er '.integrity_bindings.registry_snapshot_sha256' "$SOURCE_PROVENANCE")
+          COMPILER_METADATA_SHA=$(jq -er '.integrity_bindings.compiler_metadata_sha256' "$SOURCE_PROVENANCE")
+          jq -e \
+            --argjson sequence "${BUILD_SEQUENCE}" \
+            --arg v1 "$V1_ASSET" --arg v2 "$V2_ASSET" \
+            --arg v1_sha "$V1_SHA" --arg v2_sha "$V2_SHA" \
+            --arg source_sha "$SOURCE_TRANSACTION_SHA" \
+            --arg registry_sha "$REGISTRY_SNAPSHOT_SHA" \
+            --arg compiler_sha "$COMPILER_METADATA_SHA" \
+            '(.manifest_version == 1) and (.sequence == $sequence) and
+             (.v1_filename == $v1) and (.v1_sha256 == $v1_sha) and
+             (.v2_filename == $v2) and (.v2_sha256 == $v2_sha) and
+             (.source_transaction_sha256 == $source_sha) and
+             (.registry_snapshot_sha256 == $registry_sha) and
+             (.compiler_metadata_sha256 == $compiler_sha)' \
+            "$SOURCE_INTEGRITY" >/dev/null
+
+          # Self-check 1 (signed-region integrity): strip only the signature from
+          # the PUBLISHED file and re-canonicalize; it must equal the PAYLOAD we
+          # signed. This proves manifest_version is inside the signed region and
+          # the published JSON's signed region is exactly
+          # what the signature covers. NOTE: this is tautological w.r.t. ASSET
+          # integrity (it only relates the published JSON to the signed JSON, not
+          # to the actual asset bytes) and is complemented by self-check 2 below.
+          RECONSTRUCTED=$(jq -cS 'del(.signature)' threatdb-index-v2.json)
+          if [ "$PAYLOAD" != "$RECONSTRUCTED" ]; then
+            echo "::error::v2 index signed region drift. signed=$PAYLOAD published_region=$RECONSTRUCTED"
+            exit 1
+          fi
+
+          # Self-check 2 (asset integrity): re-derive each asset's sha256 and size
+          # from the REAL file on disk and compare to the values that were signed
+          # into the index. Without this, a stale/wrong sha256 or size could be
+          # signed and published, and clients would reject every download. This
+          # closes the gap that self-check 1 cannot (it never touches asset bytes).
+          verify_entry() {
+            local file="$1"
+            # Pull the signed sha256/size for this filename back out of the
+            # published index (not the shell vars), so we verify what shipped.
+            local want_sha want_size
+            want_sha=$(jq -r --arg f "$file" \
+              '.assets[] | select(.filename == $f) | .sha256' threatdb-index-v2.json)
+            want_size=$(jq -r --arg f "$file" \
+              '.assets[] | select(.filename == $f) | .size' threatdb-index-v2.json)
+            if [ -z "$want_sha" ] || [ "$want_sha" = "null" ]; then
+              echo "::error::asset integrity: no signed entry for $file in the v2 index"
+              exit 1
+            fi
+            local have_sha have_size
+            have_sha=$(sha256sum "$file" | cut -d' ' -f1)
+            have_size=$(stat -c%s "$file")
+            if [ "$have_sha" != "$want_sha" ]; then
+              echo "::error::asset integrity: $file sha256 mismatch. signed=$want_sha actual=$have_sha"
+              exit 1
+            fi
+            if [ "$have_size" != "$want_size" ]; then
+              echo "::error::asset integrity: $file size mismatch. signed=$want_size actual=$have_size"
+              exit 1
+            fi
+          }
+          verify_entry "$V1_ASSET"
+          verify_entry "$V2_ASSET"
+          cp -- threatdb-index-v2.json threatdb-baseline-v2.json
+
+      # Publish to ONE rolling prerelease so the daily DB builds stop burying the
+      # v* binary releases past page 1 of the releases feed (issue #140). The .dat
+      # is run-scoped (immutable, never overwritten) to avoid an asset-swap race;
+      # the manifest is overwritten in place. The tag stays pinned where it was
+      # first created (we deliberately do NOT set target_commitish).
+      #
+      - name: Publish release (immutable v2 asset)
+        # Gated by the ENABLE_THREATDB_V2 rollback switch (DB-C runbook). When false, the
+        # v2 asset and index are not uploaded; the v1 step above still ran, so old
+        # clients keep updating. The v2 index file is only generated when the gate
+        # is on, so fail_on_unmatched_files stays meaningful here.
+        if: ${{ env.ENABLE_THREATDB_V2 == 'true' }}
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ env.THREATDB_RELEASE_TAG }}
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: |
+            tirith-threatdb-v2-${{ github.run_id }}-${{ github.run_attempt }}.dat
+            threatdb-source-integrity-${{ github.run_id }}-${{ github.run_attempt }}.json
+
+      # Persist the last authenticated complete v2 generation under a filename
+      # clients never fetch. Publishing this before the discovery pointer means a
+      # later rollback can delete both live indexes without erasing the v2-only
+      # anti-drop baseline needed for safe reactivation.
+      - name: Publish release (retained non-discovery v2 baseline)
+        if: ${{ env.ENABLE_THREATDB_V2 == 'true' }}
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ env.THREATDB_RELEASE_TAG }}
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: |
+            threatdb-baseline-v2.json
+
+      # Upload the authoritative signed generation pointer only after both of its
+      # immutable assets exist on the rolling release. A failed asset upload leaves
+      # the previous index untouched; clients never discover a partial generation.
+      - name: Publish release (signed generation index commit point)
+        if: ${{ env.ENABLE_THREATDB_V2 == 'true' }}
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ env.THREATDB_RELEASE_TAG }}
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: |
+            threatdb-index-v2.json
+
+      # Push the v2 index update directly to main. Branch is unprotected and the bot
+      # has contents:write; the PR + auto-merge ceremony was unreliable (--auto silently
+      # no-ops when there are no required checks to gate on) and produced an unmerged
+      # backlog. The v2 index's PRIMARY discovery URL is its raw main copy at
+      # raw.githubusercontent.com/.../threatdb-index-v2.json (the release asset is only
+      # the fallback). The legacy manifest was already committed unconditionally above
+      # (before v2 generation), so a v2-side failure here cannot strand v1 clients.
+      # Committed ONLY when ENABLE_THREATDB_V2 is on: under the rollback switch the next cron run
+      # must stop re-committing the v2 index so a manual revert of it sticks.
+      - name: Commit v2 index to main
+        if: ${{ env.ENABLE_THREATDB_V2 == 'true' }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add threatdb-index-v2.json
+          if git diff --cached --quiet; then
+            echo "v2 index unchanged; nothing to commit."
+            exit 0
+          fi
+          git commit -m "chore: update threatdb v2 index to v${BUILD_SEQUENCE}"
+          # Absorb any commits that landed on main during the build, then push.
+          git pull --rebase --autostash origin main
+          git push origin HEAD:main
+
+      # Keep only the newest N run-scoped DB assets on the rolling release so it
+      # doesn't accumulate one asset per day forever. Every asset referenced by
+      # either CURRENT published discovery document is protected even when an
+      # older workflow was rerun and its run_id sorts below the retention window.
+      # N=3 leaves slack for an in-flight client still holding a prior manifest.
+      # v1 and v2 assets are pruned as SEPARATE groups: their
+      # names put RUN_ID at different `-`-delimited fields
+      # (tirith-threatdb-<id>-<attempt>.dat vs tirith-threatdb-v2-<id>-<attempt>.dat),
+      # so a combined sort would misorder v2. The v1 regex excludes the v2 names
+      # by requiring digits immediately after the prefix.
+      - name: Prune old threatdb assets
+        # `always()`: cleanup must run even when an upstream step failed (most
+        # concretely a v2-side failure such as the version-tag preflight). Without
+        # this, a repeating v2 failure would skip every prune and let v1+v2 assets
+        # accumulate past GitHub's 2 GB/release limit, eventually blocking uploads.
+        # Pruning keeps the newest KEEP assets, so running it on a failed build is
+        # safe (nothing new to over-delete).
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: "3"
+        run: |
+          set -euo pipefail
+
+          # Fetch the asset list ONCE into a temp file with explicit failure
+          # handling. A process-substitution `mapfile < <(gh ... | sort | tail)`
+          # swallows a failed `gh release view` (the substitution's exit status is
+          # not seen by mapfile, and tail exits 0 on empty input), so a transient
+          # API error would silently prune nothing. Capturing it here turns that
+          # into a hard failure instead of a silent no-op.
+          STATE_DIR="$(mktemp -d)"
+          ASSETS_JSON="$STATE_DIR/assets.json"
+          trap 'rm -rf "$STATE_DIR"' EXIT
+          if ! gh release view "$THREATDB_RELEASE_TAG" --repo "${{ github.repository }}" \
+              --json assets > "$ASSETS_JSON"; then
+            echo "::error::prune: failed to fetch release assets via gh release view"
+            exit 1
+          fi
+
+          # Read back BOTH discovery surfaces that clients can consume after this
+          # run: raw main (primary) and the rolling release (fallback). Local
+          # worktree copies are insufficient: a failed publish/push can leave
+          # either surface ahead of the other. Pruning protects the union.
+          if ! jq -e '.assets | any(.name == "threatdb-manifest.json")' \
+              "$ASSETS_JSON" >/dev/null; then
+            echo "::error::prune: rolling release has no legacy manifest"
+            exit 1
+          fi
+          mkdir -p "$STATE_DIR/published/release" "$STATE_DIR/published/main"
+          if ! gh release download "$THREATDB_RELEASE_TAG" \
+              --repo "${{ github.repository }}" \
+              --pattern threatdb-manifest.json \
+              --dir "$STATE_DIR/published/release" --clobber; then
+            echo "::error::prune: failed to download the published legacy manifest"
+            exit 1
+          fi
+
+          if ! git fetch --quiet origin main; then
+            echo "::error::prune: failed to fetch the primary main discovery surface"
+            exit 1
+          fi
+          if ! git show origin/main:threatdb-manifest.json \
+              > "$STATE_DIR/published/main/threatdb-manifest.json"; then
+            echo "::error::prune: main has no readable legacy manifest"
+            exit 1
+          fi
+
+          declare -A PROTECTED_ASSETS=()
+          protect_asset() {
+            local asset="$1"
+            if [[ ! "$asset" =~ ^tirith-threatdb-([0-9]+-[0-9]+|v2-[0-9]+-[0-9]+)\.dat$ ]]; then
+              echo "::error::prune: discovery document references an invalid asset name: $asset"
+              exit 1
+            fi
+            if ! jq -e --arg asset "$asset" \
+                '.assets | any(.name == $asset)' "$ASSETS_JSON" >/dev/null; then
+              echo "::error::prune: discovery document references missing release asset: $asset"
+              exit 1
+            fi
+            PROTECTED_ASSETS["$asset"]=1
+          }
+
+          protect_manifest() {
+            local file="$1"
+            local label="$2"
+            local url asset
+            if ! url=$(jq -er \
+                'select(type == "object") | .url | select(type == "string" and length > 0)' \
+                "$file"); then
+              echo "::error::prune: $label has no valid asset URL"
+              exit 1
+            fi
+            asset="${url##*/}"
+            protect_asset "$asset"
+          }
+
+          protect_index() {
+            local file="$1"
+            local label="$2"
+            local references
+            if ! jq -e '
+                (type == "object") and
+                (.manifest_version == 1 or .manifest_version == 2) and
+                (.assets | type == "array" and length == 2) and
+                ([.assets[] | select(.format == 1)] | length == 1) and
+                ([.assets[] | select(.format == 2)] | length == 1) and
+                ([.assets[].filename] | unique | length == 2) and
+                ([.assets[].url] | unique | length == 2) and
+                all(.assets[];
+                  (.filename | type == "string" and length > 0) and
+                  (.url | type == "string" and length > 0) and
+                  (.sha256 | type == "string" and test("^[0-9A-Fa-f]{64}$")) and
+                  (.size | type == "number" and floor == . and . > 0))
+              ' "$file" >/dev/null; then
+              echo "::error::prune: $label has malformed asset references"
+              exit 1
+            fi
+            if ! references=$(jq -r '.assets[] | [.filename, .url] | @tsv' "$file"); then
+              echo "::error::prune: failed to extract $label asset references"
+              exit 1
+            fi
+            if [ -z "$references" ]; then
+              echo "::error::prune: $label yielded no asset references"
+              exit 1
+            fi
+            while IFS=$'\t' read -r filename url; do
+              local url_asset="${url##*/}"
+              if [ "$filename" != "$url_asset" ]; then
+                echo "::error::prune: $label filename/URL disagreement: $filename != $url_asset"
+                exit 1
+              fi
+              protect_asset "$filename"
+            done <<< "$references"
+          }
+
+          protect_manifest \
+            "$STATE_DIR/published/release/threatdb-manifest.json" \
+            "rolling-release legacy manifest"
+          protect_manifest \
+            "$STATE_DIR/published/main/threatdb-manifest.json" \
+            "main legacy manifest"
+
+          # The retained baseline is not a client discovery surface, but its
+          # referenced generation must remain downloadable so reactivation can
+          # verify bytes and apply v2-only anti-drop floors.
+          if jq -e '.assets | any(.name == "threatdb-baseline-v2.json")' \
+              "$ASSETS_JSON" >/dev/null; then
+            if ! gh release download "$THREATDB_RELEASE_TAG" \
+                --repo "${{ github.repository }}" \
+                --pattern threatdb-baseline-v2.json \
+                --dir "$STATE_DIR/published/release" --clobber; then
+              echo "::error::prune: failed to download the retained v2 baseline"
+              exit 1
+            fi
+            protect_index \
+              "$STATE_DIR/published/release/threatdb-baseline-v2.json" \
+              "retained non-discovery v2 baseline"
+          fi
+
+          # The release v2 channel is optional under the rollback switch. When
+          # present, require each explicit filename to agree with its URL and
+          # protect the referenced asset; malformed disagreement fails closed.
+          if jq -e '.assets | any(.name == "threatdb-index-v2.json")' \
+              "$ASSETS_JSON" >/dev/null; then
+            if ! gh release download "$THREATDB_RELEASE_TAG" \
+                --repo "${{ github.repository }}" \
+                --pattern threatdb-index-v2.json \
+                --dir "$STATE_DIR/published/release" --clobber; then
+              echo "::error::prune: failed to download the published v2 index"
+              exit 1
+            fi
+            protect_index \
+              "$STATE_DIR/published/release/threatdb-index-v2.json" \
+              "rolling-release v2 index"
+          fi
+
+          # main's v2 index is optional while the rollback switch is in use, but
+          # when it exists every one of its references remains live and must be
+          # protected even if the rolling release has already advanced.
+          if git cat-file -e origin/main:threatdb-index-v2.json 2>/dev/null; then
+            if ! git show origin/main:threatdb-index-v2.json \
+                > "$STATE_DIR/published/main/threatdb-index-v2.json"; then
+              echo "::error::prune: failed to read main's existing v2 index"
+              exit 1
+            fi
+            protect_index \
+              "$STATE_DIR/published/main/threatdb-index-v2.json" \
+              "main v2 index"
+          fi
+
+          # Select v1/v2 databases by their independent retention groups, then
+          # delete a generation's source provenance only when neither database
+          # format from that exact run+attempt remains. Discovery-protected DBs
+          # therefore retain their provenance even when older than KEEP.
+          if ! STALE_OUTPUT=$(
+            .github/scripts/select-threatdb-prune-assets.sh \
+              "$ASSETS_JSON" "$KEEP" "${!PROTECTED_ASSETS[@]}"
+          ); then
+            echo "::error::prune: failed to select stale DB/provenance assets"
+            exit 1
+          fi
+          STALE=()
+          if [ -n "$STALE_OUTPUT" ]; then
+            mapfile -t STALE <<< "$STALE_OUTPUT"
+          fi
+          if [ "${#STALE[@]}" -eq 0 ]; then
+            echo "Prune: nothing to delete."
+            exit 0
+          fi
+          for asset in "${STALE[@]}"; do
+            echo "Pruning stale asset: $asset"
+            gh release delete-asset "$THREATDB_RELEASE_TAG" "$asset" \
+              --repo "${{ github.repository }}" --yes
+          done

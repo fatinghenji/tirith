@@ -4,6 +4,28 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Standard Webhooks requires symmetric signing keys to contain between 24
+/// and 64 bytes after decoding the `whsec_` payload.
+pub const MIN_WEBHOOK_SECRET_KEY_BYTES: usize = 24;
+pub const MAX_WEBHOOK_SECRET_KEY_BYTES: usize = 64;
+
+/// Decode and validate a Polar/Standard-Webhooks signing secret.
+///
+/// Kept public within the binary crate so configuration loading and request
+/// verification enforce the same format and bounded key-length invariant.
+pub fn decode_webhook_secret(secret: &str) -> Result<Vec<u8>, WebhookError> {
+    let key_b64 = secret
+        .strip_prefix("whsec_")
+        .ok_or(WebhookError::InvalidSecret)?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(key_b64)
+        .map_err(|_| WebhookError::InvalidSecret)?;
+    if !(MIN_WEBHOOK_SECRET_KEY_BYTES..=MAX_WEBHOOK_SECRET_KEY_BYTES).contains(&decoded.len()) {
+        return Err(WebhookError::InvalidSecret);
+    }
+    Ok(decoded)
+}
+
 /// Verify a Standard Webhooks signature (used by Polar.sh).
 ///
 /// - `secret`: `"whsec_<base64_key>"` — prefix stripped, remainder base64-decoded to get HMAC key.
@@ -20,20 +42,16 @@ pub fn verify_webhook(
     sig_header: &str,
     max_age_secs: i64,
 ) -> Result<(), WebhookError> {
-    // Decode the secret: strip "whsec_" prefix, base64-decode the remainder.
-    let key_b64 = secret
-        .strip_prefix("whsec_")
-        .ok_or(WebhookError::InvalidSecret)?;
-    let key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(key_b64)
-        .map_err(|_| WebhookError::InvalidSecret)?;
+    // Defense in depth: configuration validates this at startup, but keep the
+    // request boundary independently safe for direct callers and future wiring.
+    let key_bytes = decode_webhook_secret(secret)?;
 
-    // Replay protection
+    // Replay protection: reject messages whose timestamp is out of window.
     let ts: i64 = timestamp
         .parse()
         .map_err(|_| WebhookError::InvalidTimestamp)?;
     let now = chrono::Utc::now().timestamp();
-    // Use checked_sub to prevent overflow with extreme timestamps
+    // checked_sub guards against overflow on extreme timestamps.
     let expired = now
         .checked_sub(ts)
         .map(|d| d.unsigned_abs() > max_age_secs as u64)
@@ -42,7 +60,7 @@ pub fn verify_webhook(
         return Err(WebhookError::TimestampExpired);
     }
 
-    // HMAC-SHA256: key = decoded secret, msg = "{msg_id}.{timestamp}.{body}"
+    // Standard Webhooks HMAC input: "{msg_id}.{timestamp}.{body}".
     let mut mac =
         HmacSha256::new_from_slice(&key_bytes).map_err(|_| WebhookError::InvalidSecret)?;
     mac.update(msg_id.as_bytes());
@@ -53,7 +71,8 @@ pub fn verify_webhook(
 
     let expected = mac.finalize().into_bytes();
 
-    // Parse space-separated "v1,<base64>" entries — any valid match = pass (key rotation).
+    // Accept any matching "v1,<base64>" entry — supports key rotation
+    // where multiple signatures are sent in the same header.
     let mut found_v1 = false;
     for entry in sig_header.split(' ') {
         let entry = entry.trim();
@@ -114,7 +133,7 @@ mod tests {
     use super::*;
 
     fn make_secret() -> (String, Vec<u8>) {
-        let raw_key = b"test-secret-key-32bytes-long!!!!"; // 32 bytes
+        let raw_key = b"test-secret-key-32bytes-long!!!!";
         let b64 = base64::engine::general_purpose::STANDARD.encode(raw_key);
         (format!("whsec_{b64}"), raw_key.to_vec())
     }
@@ -151,7 +170,6 @@ mod tests {
         let msg_id = "msg_abc123";
         let ts = chrono::Utc::now().timestamp().to_string();
 
-        // Sign with a different key
         let wrong_key = b"wrong-secret-key-32bytes-long!!!";
         let sig_header = sign_body(wrong_key, msg_id, &ts, body);
 
@@ -179,7 +197,7 @@ mod tests {
         let ts = chrono::Utc::now().timestamp().to_string();
 
         let valid_sig = sign_body(&key, msg_id, &ts, body);
-        // Simulate key rotation: old (invalid) sig first, then current (valid) sig
+        // Key rotation: a stale signature first, then the current one.
         let sig_header = format!("v1,aW52YWxpZHNpZ25hdHVyZWhlcmUxMjM0NTY3 {valid_sig}");
 
         assert!(verify_webhook(&secret, msg_id, &ts, body, &sig_header, 300).is_ok());
@@ -211,5 +229,43 @@ mod tests {
             300,
         );
         assert!(matches!(result, Err(WebhookError::InvalidSecret)));
+    }
+
+    #[test]
+    fn test_out_of_range_secret_lengths_are_rejected() {
+        for key in [
+            Vec::new(),
+            vec![0x41],
+            vec![0x42; MIN_WEBHOOK_SECRET_KEY_BYTES - 1],
+            vec![0x43; MAX_WEBHOOK_SECRET_KEY_BYTES + 1],
+        ] {
+            let secret = format!(
+                "whsec_{}",
+                base64::engine::general_purpose::STANDARD.encode(key)
+            );
+            assert!(
+                matches!(
+                    decode_webhook_secret(&secret),
+                    Err(WebhookError::InvalidSecret)
+                ),
+                "a Standard Webhooks secret must decode to 24 through 64 bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn test_standard_webhooks_key_length_range_is_accepted() {
+        for length in [
+            MIN_WEBHOOK_SECRET_KEY_BYTES,
+            32,
+            MAX_WEBHOOK_SECRET_KEY_BYTES,
+        ] {
+            let key = vec![0x5a; length];
+            let secret = format!(
+                "whsec_{}",
+                base64::engine::general_purpose::STANDARD.encode(&key)
+            );
+            assert_eq!(decode_webhook_secret(&secret).unwrap(), key);
+        }
     }
 }

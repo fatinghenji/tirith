@@ -6,14 +6,22 @@
 //! 3. Inspect tokens (decode payload without signature verification)
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signer, SigningKey};
 
+#[cfg(windows)]
+mod secure_file_windows;
+
 const B64URL: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+/// Maximum accepted token size for `inspect`. A real license token is a few
+/// hundred bytes; anything near 64 KiB is junk or a resource-exhaustion
+/// attempt, so it is rejected before base64/JSON decoding (repo-0451).
+const MAX_INSPECT_TOKEN_BYTES: usize = 64 * 1024;
 
 #[derive(Parser)]
 #[command(name = "tirith-sign", about = "Sign tirith license tokens")]
@@ -26,7 +34,8 @@ struct Cli {
 enum Commands {
     /// Generate a new Ed25519 keypair.
     ///
-    /// Writes the 32-byte private seed to a file (mode 0600).
+    /// Writes the 32-byte private seed to a private file (mode 0600 or a
+    /// protected user-only ACL).
     /// Prints the public key as a Rust byte-array literal for KEYRING.
     Keygen {
         /// Output file for the private key seed (32 bytes, hex-encoded).
@@ -118,17 +127,18 @@ fn main() {
     }
 }
 
-fn cmd_keygen(output: &PathBuf, kid: &str) -> Result<(), String> {
+fn cmd_keygen(output: &Path, kid: &str) -> Result<(), String> {
     use rand_core::OsRng;
 
     let sk = SigningKey::generate(&mut OsRng);
     let pk = sk.verifying_key();
     let seed = sk.to_bytes();
 
-    // Write seed as hex to file
-    let hex_seed: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+    let hex_seed: String = bytes_to_hex(&seed);
 
-    // Write with restricted permissions
+    // The private key is a signing trust root. Every supported platform must
+    // establish restrictive access at creation time; there is no permissive
+    // fallback and no post-creation window with inherited access.
     #[cfg(unix)]
     {
         use std::io::Write;
@@ -150,33 +160,25 @@ fn cmd_keygen(output: &PathBuf, kid: &str) -> Result<(), String> {
             })?;
         f.write_all(hex_seed.as_bytes())
             .map_err(|e| format!("write failed: {e}"))?;
+        f.sync_all().map_err(|e| format!("sync failed: {e}"))?;
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(output)
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    format!(
-                        "{} already exists — refusing to overwrite private key",
-                        output.display()
-                    )
-                } else {
-                    format!("cannot create {}: {e}", output.display())
-                }
-            })?;
-        f.write_all(hex_seed.as_bytes())
-            .map_err(|e| format!("write failed: {e}"))?;
+        secure_file_windows::write_private_file(output, hex_seed.as_bytes())?;
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        return Err(format!(
+            "secure private-key creation is not implemented on this platform; refusing to create {}",
+            output.display()
+        ));
     }
 
     eprintln!("Private key seed written to: {}", output.display());
     eprintln!("KEEP THIS FILE SECRET. Do not commit it to version control.\n");
 
-    // Print public key as Rust array literal for KEYRING
     let pk_bytes = pk.to_bytes();
     println!("// Add this to KEYRING in crates/tirith-core/src/license.rs:");
     println!("KeyEntry {{");
@@ -194,8 +196,7 @@ fn cmd_keygen(output: &PathBuf, kid: &str) -> Result<(), String> {
     println!("\n    ],");
     println!("}}\n");
 
-    // Also print as hex for reference
-    let pk_hex: String = pk_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let pk_hex: String = bytes_to_hex(&pk_bytes);
     eprintln!("Public key (hex): {pk_hex}");
 
     Ok(())
@@ -203,7 +204,7 @@ fn cmd_keygen(output: &PathBuf, kid: &str) -> Result<(), String> {
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_sign(
-    key_path: &PathBuf,
+    key_path: &Path,
     kid: &str,
     tier: &str,
     expires: &str,
@@ -212,7 +213,6 @@ fn cmd_sign(
     seat_count: Option<u32>,
     nbf: Option<String>,
 ) -> Result<(), String> {
-    // Validate tier
     let tier_lower = tier.to_lowercase();
     match tier_lower.as_str() {
         "community" | "pro" | "team" | "enterprise" => {}
@@ -223,16 +223,13 @@ fn cmd_sign(
         }
     }
 
-    // Parse expiry → Unix timestamp
     let exp_ts = parse_timestamp(expires)?;
 
-    // Parse nbf if provided
     let nbf_ts = match &nbf {
         Some(s) => Some(parse_timestamp(s)?),
         None => None,
     };
 
-    // Read private key seed
     let hex_seed = std::fs::read_to_string(key_path)
         .map_err(|e| format!("cannot read key file {}: {e}", key_path.display()))?;
     let seed_bytes = hex_to_bytes(hex_seed.trim())?;
@@ -246,7 +243,6 @@ fn cmd_sign(
     seed_arr.copy_from_slice(&seed_bytes);
     let sk = SigningKey::from_bytes(&seed_arr);
 
-    // Build payload JSON
     let mut payload = serde_json::json!({
         "iss": "tirith.dev",
         "aud": "tirith-cli",
@@ -271,23 +267,29 @@ fn cmd_sign(
     let payload_json = serde_json::to_string(&payload).map_err(|e| format!("serialize: {e}"))?;
     let payload_bytes = payload_json.as_bytes();
 
-    // Sign
     let sig = sk.sign(payload_bytes);
 
-    // Encode
     let payload_b64 = B64URL.encode(payload_bytes);
     let sig_b64 = B64URL.encode(sig.to_bytes());
     let token = format!("{payload_b64}.{sig_b64}");
 
     println!("{token}");
 
-    // Print summary to stderr
+    // Summary printed to stderr so stdout stays machine-parseable.
     let exp_dt = chrono::DateTime::from_timestamp(exp_ts, 0)
         .map(|d| d.format("%Y-%m-%d").to_string())
         .unwrap_or_else(|| exp_ts.to_string());
     eprintln!("\nToken issued:");
     eprintln!("  tier:    {tier_lower}");
     eprintln!("  kid:     {kid}");
+    // repo-0238: `kid` is an independent caller string while the signature is
+    // made by THIS seed's key. Print the signing key's public fingerprint so
+    // the operator can verify it is the key registered under `kid` in the
+    // production keyring — a mismatch means decoders will reject the token.
+    eprintln!(
+        "  signing pubkey (hex): {}",
+        bytes_to_hex(&sk.verifying_key().to_bytes())
+    );
     eprintln!("  expires: {exp_dt} (ts: {exp_ts})");
     if let Some(ref org) = org_id {
         eprintln!("  org_id:  {org}");
@@ -300,7 +302,9 @@ fn cmd_sign(
     }
     eprintln!("\nActivate with: tirith activate <token>");
 
-    // Verify round-trip
+    // Re-verify the token we just produced. A failure here indicates the
+    // signing path itself is broken; refusing to print is safer than
+    // shipping an unverifiable token.
     let vk = sk.verifying_key();
     let (p_b64, s_b64) = token.split_once('.').unwrap();
     let p_bytes = B64URL.decode(p_b64).unwrap();
@@ -319,18 +323,25 @@ fn cmd_inspect(token_arg: Option<String>) -> Result<(), String> {
     let token = match token_arg {
         Some(t) => t,
         None => {
-            // Read from stdin
-            let mut buf = String::new();
+            // Bounded read: never buffer more than the limit + 1 from stdin.
+            let mut buf = Vec::new();
             std::io::stdin()
-                .read_to_string(&mut buf)
+                .take((MAX_INSPECT_TOKEN_BYTES + 1) as u64)
+                .read_to_end(&mut buf)
                 .map_err(|e| format!("failed to read stdin: {e}"))?;
-            buf
+            String::from_utf8(buf).map_err(|_| "token from stdin is not valid UTF-8")?
         }
     };
     let token = token.trim();
 
     if token.is_empty() {
         return Err("no token provided".to_string());
+    }
+    if token.len() > MAX_INSPECT_TOKEN_BYTES {
+        return Err(format!(
+            "token is too large ({} bytes; max {MAX_INSPECT_TOKEN_BYTES}) — refusing to inspect",
+            token.len()
+        ));
     }
 
     let (payload_b64, sig_b64) = token
@@ -354,19 +365,24 @@ fn cmd_inspect(token_arg: Option<String>) -> Result<(), String> {
     let payload: serde_json::Value =
         serde_json::from_slice(&payload_bytes).map_err(|e| format!("invalid JSON payload: {e}"))?;
 
-    // Pretty-print payload
     println!(
         "{}",
         serde_json::to_string_pretty(&payload).unwrap_or_else(|_| format!("{payload:?}"))
     );
 
-    // Summary
-    println!("\n--- Summary ---");
+    // `inspect` performs NO signature verification. Every decoded field may be
+    // attacker-controlled, so strings are JSON-escaped before they reach the
+    // operator's terminal (raw ESC/OSC sequences could spoof output or drive
+    // terminal features such as OSC 52 clipboard writes) and the summary is
+    // explicitly labelled unverified (repo-0451).
+    println!(
+        "\n--- Summary (UNVERIFIED — signature NOT checked; fields may be attacker-controlled) ---"
+    );
     if let Some(tier) = payload.get("tier").and_then(|v| v.as_str()) {
-        println!("Tier:    {tier}");
+        println!("Tier:    {}", escape_decoded(tier));
     }
     if let Some(kid) = payload.get("kid").and_then(|v| v.as_str()) {
-        println!("Key ID:  {kid}");
+        println!("Key ID:  {}", escape_decoded(kid));
     }
     if let Some(exp) = payload.get("exp").and_then(|v| v.as_i64()) {
         let exp_dt = chrono::DateTime::from_timestamp(exp, 0)
@@ -383,10 +399,10 @@ fn cmd_inspect(token_arg: Option<String>) -> Result<(), String> {
         println!("Not before: {nbf_dt}");
     }
     if let Some(org) = payload.get("org_id").and_then(|v| v.as_str()) {
-        println!("Org ID:  {org}");
+        println!("Org ID:  {}", escape_decoded(org));
     }
     if let Some(sso) = payload.get("sso_provider").and_then(|v| v.as_str()) {
-        println!("SSO:     {sso}");
+        println!("SSO:     {}", escape_decoded(sso));
     }
     if let Some(seats) = payload.get("seat_count").and_then(|v| v.as_u64()) {
         println!("Seats:   {seats}");
@@ -405,16 +421,14 @@ fn cmd_inspect(token_arg: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────
-
-/// Parse a date string (YYYY-MM-DD) or Unix timestamp into i64.
+/// Parse a date string (YYYY-MM-DD) or Unix timestamp into i64. Dates
+/// resolve to 23:59:59 UTC on the given day so tokens stay valid through
+/// the stated expiry day.
 fn parse_timestamp(s: &str) -> Result<i64, String> {
-    // Try Unix timestamp first
     if let Ok(ts) = s.parse::<i64>() {
         return Ok(ts);
     }
 
-    // Try YYYY-MM-DD → end of day UTC
     let date = NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .map_err(|_| format!("invalid date/timestamp '{s}' — use YYYY-MM-DD or Unix timestamp"))?;
     let dt = date
@@ -423,7 +437,26 @@ fn parse_timestamp(s: &str) -> Result<i64, String> {
     Ok(dt.and_utc().timestamp())
 }
 
-/// Decode hex string to bytes.
+/// Lowercase hex-encode a byte slice. A tiny local helper so the three call
+/// sites do not each `format!`-collect (which clippy's `format_collect` flags).
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+/// JSON-encode a decoded payload string so terminal control characters
+/// (ESC/OSC/CSI, CR, LF) can never reach the operator's terminal raw when an
+/// unverified token is inspected. The surrounding quotes also make leading or
+/// trailing whitespace visible.
+fn escape_decoded(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"<unencodable>\"".to_string())
+}
+
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
     if hex.len() % 2 != 0 {
         return Err("hex string has odd length".to_string());
@@ -450,7 +483,6 @@ mod tests {
     #[test]
     fn test_parse_timestamp_date() {
         let ts = parse_timestamp("2025-12-31").unwrap();
-        // Should be 2025-12-31 23:59:59 UTC
         let dt = chrono::DateTime::from_timestamp(ts, 0).unwrap();
         assert_eq!(dt.format("%Y-%m-%d").to_string(), "2025-12-31");
     }
@@ -463,7 +495,7 @@ mod tests {
     #[test]
     fn test_hex_roundtrip() {
         let bytes = vec![0u8, 255, 128, 1];
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let hex: String = bytes_to_hex(&bytes);
         assert_eq!(hex_to_bytes(&hex).unwrap(), bytes);
     }
 
@@ -487,7 +519,6 @@ mod tests {
         let sig_b64 = B64URL.encode(sig.to_bytes());
         let token = format!("{payload_b64}.{sig_b64}");
 
-        // Verify
         let (p, s) = token.split_once('.').unwrap();
         let p_bytes = B64URL.decode(p).unwrap();
         let s_bytes = B64URL.decode(s).unwrap();
@@ -495,10 +526,10 @@ mod tests {
         assert!(vk.verify_strict(&p_bytes, &sig_check).is_ok());
     }
 
+    /// Guards the token wire format expected by `license.rs`:
+    /// `base64url(payload_json).base64url(ed25519_sig)`.
     #[test]
     fn test_token_matches_license_rs_format() {
-        // Verify the token format matches what license.rs expects:
-        // base64url(payload_json).base64url(ed25519_sig)
         let sk = SigningKey::generate(&mut OsRng);
 
         let payload =
@@ -510,16 +541,45 @@ mod tests {
         let sig_b64 = B64URL.encode(sig.to_bytes());
         let token = format!("{payload_b64}.{sig_b64}");
 
-        // Token must have exactly one dot
         assert_eq!(token.matches('.').count(), 1);
 
-        // Both segments must be non-empty
         let (left, right) = token.split_once('.').unwrap();
         assert!(!left.is_empty());
         assert!(!right.is_empty());
 
-        // Signature must be 64 bytes when decoded
         let sig_decoded = B64URL.decode(right).unwrap();
         assert_eq!(sig_decoded.len(), 64);
+    }
+
+    /// repo-0451: decoded payload strings must be JSON-escaped before they
+    /// reach the terminal, so ANSI/OSC sequences in an unverified token are
+    /// displayed inertly instead of being interpreted by the terminal.
+    #[test]
+    fn test_escape_decoded_neutralizes_control_sequences() {
+        let escaped = escape_decoded("pro\u{1b}]52;c;YXR0YWNr\u{7}\r\nFAKE");
+        assert_eq!(escaped, "\"pro\\u001b]52;c;YXR0YWNr\\u0007\\r\\nFAKE\"");
+        assert!(!escaped.contains('\u{1b}'));
+        assert!(!escaped.contains('\r'));
+        assert!(!escaped.contains('\n'));
+    }
+
+    /// repo-0451: inspect must reject oversized tokens before decoding.
+    #[test]
+    fn test_inspect_rejects_oversized_token() {
+        let oversized = "a".repeat(MAX_INSPECT_TOKEN_BYTES + 1);
+        let err = cmd_inspect(Some(oversized)).unwrap_err();
+        assert!(err.contains("too large"), "unexpected error: {err}");
+    }
+
+    /// repo-0451: a token at the size limit still fails cleanly (not a valid
+    /// token), but with a decode error rather than the size guard.
+    #[test]
+    fn test_inspect_size_limit_boundary() {
+        let at_limit = "a".repeat(MAX_INSPECT_TOKEN_BYTES);
+        let err = cmd_inspect(Some(at_limit)).unwrap_err();
+        assert!(
+            !err.contains("too large"),
+            "boundary token wrongly rejected"
+        );
     }
 }

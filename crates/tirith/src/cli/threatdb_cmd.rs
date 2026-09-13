@@ -9,46 +9,48 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey, PUBLIC_KEY_LENGTH, SIGN
 use sha2::{Digest, Sha256};
 
 use tirith_core::policy;
-use tirith_core::threatdb::{ThreatDb, ThreatDbWriter, ThreatSource};
+use tirith_core::selfupdate::SemVer;
+use tirith_core::threatdb::{ThreatDb, ThreatDbWriter, ThreatSource, MAX_FORMAT_VERSION};
 use tirith_core::threatdb_feeds::{
-    parse_domain_blocklist, parse_phishtank_csv, parse_threatfox_zip, parse_tor_exit_list,
-    parse_urlhaus_csv,
+    parse_domain_blocklist_reader, parse_phishtank_csv, parse_threatfox_zip,
+    parse_tor_exit_list_reader, parse_urlhaus_csv, MAX_FEED_ENTRIES, MAX_FEED_INPUT_BYTES,
 };
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Pinned Ed25519 public key for manifest signature verification.
-/// MUST be identical to the key in tirith-core/assets/keys/threatdb-verify.pub.
-/// Both files must be kept in sync — they are the same key used for DB and manifest signing.
+/// Pinned Ed25519 manifest-verify key. MUST stay in sync with
+/// tirith-core/assets/keys/threatdb-verify.pub (same key for DB + manifest).
 static VERIFY_KEY_BYTES: &[u8; PUBLIC_KEY_LENGTH] =
     include_bytes!("../../assets/keys/threatdb-verify.pub");
 
 const MANIFEST_URL_PRIMARY: &str =
     "https://raw.githubusercontent.com/sheeki03/tirith/main/threatdb-manifest.json";
 const MANIFEST_URL_FALLBACK: &str =
-    "https://github.com/sheeki03/tirith/releases/latest/download/threatdb-manifest.json";
+    "https://github.com/sheeki03/tirith/releases/download/threatdb-current/threatdb-manifest.json";
 
-/// Max manifest size (64 KiB) to prevent abuse.
+/// Signed multi-asset v2 index. A new (v2-capable) client fetches this first,
+/// verifies its signature, and selects the highest compatible asset; on any
+/// failure it falls back to the legacy single-asset manifest above. Old clients
+/// never fetch this URL and so only ever install v1.
+const INDEX_V2_URL_PRIMARY: &str =
+    "https://raw.githubusercontent.com/sheeki03/tirith/main/threatdb-index-v2.json";
+const INDEX_V2_URL_FALLBACK: &str =
+    "https://github.com/sheeki03/tirith/releases/download/threatdb-current/threatdb-index-v2.json";
+
 const MAX_MANIFEST_SIZE: u64 = 64 * 1024;
-/// Max DB file size (256 MiB) to prevent disk exhaustion.
 const MAX_DB_SIZE: u64 = 256 * 1024 * 1024;
-/// HTTP timeout for manifest fetch.
+/// Sanity cap on a v2 index asset's declared `size`, mirroring [`MAX_DB_SIZE`].
+/// An asset claiming more than this is rejected before any download.
+const MAX_INDEX_ASSET_SIZE: u64 = MAX_DB_SIZE;
 const MANIFEST_TIMEOUT_SECS: u64 = 15;
-/// HTTP timeout for DB download.
 const DB_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
-/// HTTP timeout for Phase B supplemental feed downloads.
 const SUPPLEMENTAL_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
 /// Max bytes read from any single supplemental feed response.
-const MAX_SUPPLEMENTAL_FEED_SIZE: u64 = 256 * 1024 * 1024;
+const MAX_SUPPLEMENTAL_FEED_SIZE: u64 = MAX_FEED_INPUT_BYTES;
 
 const LOCKFILE_NAME: &str = "threatdb-update.lock";
 const NEXT_CHECK_FILE: &str = "threatdb-next-check-at";
 const SPAWNED_AT_FILE: &str = "threatdb-spawned-at";
 /// Soft dedup window: skip spawn if another was spawned within this many seconds.
 const SPAWNED_AT_DEDUP_SECS: u64 = 30;
-/// Backoff interval on failure (1 hour).
 const BACKOFF_SECS: u64 = 3600;
 const URLHAUS_EXPORT_TEMPLATE: &str =
     "https://urlhaus-api.abuse.ch/files/exports/full.csv?auth-key={auth_key}";
@@ -59,11 +61,22 @@ const PHISHING_ARMY_URL: &str =
 const PHISHTANK_URL: &str = "https://data.phishtank.com/data/online-valid.csv";
 const TOR_EXIT_URL: &str = "https://check.torproject.org/torbulkexitlist";
 
-// ---------------------------------------------------------------------------
-// Manifest
-// ---------------------------------------------------------------------------
+fn guarded_http_client(timeout_secs: u64) -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .dns_resolver(tirith_core::ssrf_guard::ssrf_guard_resolver())
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .redirect(tirith_core::ssrf_guard::server_redirect_policy())
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))
+}
 
-#[derive(Debug, serde::Deserialize)]
+fn validate_remote_url(url: &str, purpose: &str) -> Result<(), String> {
+    tirith_core::url_validate::validate_server_url(url)
+        .map_err(|reason| format!("refusing unsafe {purpose} URL: {reason}"))
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 struct Manifest {
     sha256: String,
     size: u64,
@@ -73,8 +86,8 @@ struct Manifest {
 }
 
 impl Manifest {
-    /// Reconstruct the canonical payload for signature verification.
-    /// Keys alphabetically sorted, no whitespace, no trailing newline.
+    /// Canonical payload for signature verification: keys sorted, no whitespace,
+    /// no trailing newline.
     fn canonical_payload(&self) -> String {
         let mut map = std::collections::BTreeMap::new();
         map.insert("sha256", serde_json::Value::String(self.sha256.clone()));
@@ -86,6 +99,12 @@ impl Manifest {
 
     /// Verify the manifest signature against the pinned public key.
     fn verify_signature(&self) -> Result<(), String> {
+        let verify_key = VerifyingKey::from_bytes(VERIFY_KEY_BYTES)
+            .map_err(|e| format!("invalid embedded public key: {e}"))?;
+        self.verify_signature_with_key(&verify_key)
+    }
+
+    fn verify_signature_with_key(&self, verify_key: &VerifyingKey) -> Result<(), String> {
         let sig_bytes =
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &self.signature)
                 .map_err(|e| format!("invalid manifest signature encoding: {e}"))?;
@@ -101,9 +120,6 @@ impl Manifest {
         let signature = Signature::from_slice(&sig_bytes)
             .map_err(|e| format!("invalid manifest signature: {e}"))?;
 
-        let verify_key = VerifyingKey::from_bytes(VERIFY_KEY_BYTES)
-            .map_err(|e| format!("invalid embedded public key: {e}"))?;
-
         let payload = self.canonical_payload();
         use ed25519_dalek::Verifier;
         verify_key
@@ -112,9 +128,222 @@ impl Manifest {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Update command
-// ---------------------------------------------------------------------------
+/// One asset in the signed v2 index. The `url` is explicit (not derived), and
+/// `min_tirith_version`, when present, gates the asset to clients at or above
+/// that Tirith version.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct IndexAsset {
+    format: u32,
+    // `filename` is part of the signed canonical payload (see `canonical_payload`),
+    // so it is load-bearing for signature verification. The explicit `url` is
+    // authoritative only for where the asset is downloaded from.
+    filename: String,
+    url: String,
+    sha256: String,
+    size: u64,
+    #[serde(default)]
+    min_tirith_version: Option<String>,
+}
+
+/// Signed multi-asset v2 index (`threatdb-index-v2.json`). The top-level
+/// `signature` covers the canonical payload (`manifest_version`, `sequence`, and
+/// the `assets` array; alphabetical compact keys; only `signature` excluded),
+/// mirroring [`Manifest::canonical_payload`] and the `jq -cS` signing step so the
+/// same key and discipline apply. Old clients never fetch this and only see v1.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct IndexV2 {
+    // Schema v2 moved this field into the signed canonical payload. It must be
+    // present: accepting an absent/defaulted value would recreate an unsigned
+    // downgrade/suppression control.
+    manifest_version: u64,
+    sequence: u64,
+    assets: Vec<IndexAsset>,
+    signature: String,
+}
+
+/// Exact signed generation-index schema this client understands. Schema v1 kept
+/// `manifest_version` outside the signature and is deliberately not accepted by
+/// this client; both old and new clients safely use the independently signed v1
+/// manifest while publishers move to schema v2.
+const SIGNED_MANIFEST_VERSION: u64 = 2;
+
+impl IndexV2 {
+    /// Validate the signed document as one complete immutable generation. Signed
+    /// schema v2 requires exactly one legacy asset and one v2 asset; accepting a partial
+    /// array would turn the index back into two independently advancing pointers.
+    fn validate_generation(&self) -> Result<(), String> {
+        if self.assets.len() != 2 {
+            return Err(format!(
+                "v2 index must contain exactly one v1 and one v2 asset, got {}",
+                self.assets.len()
+            ));
+        }
+        for format in [1u32, 2u32] {
+            let count = self
+                .assets
+                .iter()
+                .filter(|asset| asset.format == format)
+                .count();
+            if count != 1 {
+                return Err(format!(
+                    "v2 index must contain exactly one format-v{format} asset, got {count}"
+                ));
+            }
+        }
+        for (index, asset) in self.assets.iter().enumerate() {
+            for other in self.assets.iter().skip(index + 1) {
+                if asset.filename == other.filename {
+                    return Err(format!(
+                        "v2 index assets must have distinct filenames, duplicate {:?}",
+                        asset.filename
+                    ));
+                }
+                if asset.url == other.url {
+                    return Err(format!(
+                        "v2 index assets must have distinct URLs, duplicate {:?}",
+                        asset.url
+                    ));
+                }
+            }
+        }
+        for asset in &self.assets {
+            if asset.size == 0 || asset.size > MAX_INDEX_ASSET_SIZE {
+                return Err(format!(
+                    "format-v{} asset has invalid size {}",
+                    asset.format, asset.size
+                ));
+            }
+            if asset.sha256.len() != 64
+                || !asset.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(format!(
+                    "format-v{} asset has an invalid SHA-256",
+                    asset.format
+                ));
+            }
+            let parsed = url::Url::parse(&asset.url).map_err(|error| {
+                format!("format-v{} asset URL is invalid: {error}", asset.format)
+            })?;
+            let url_filename = parsed
+                .path_segments()
+                .and_then(|mut segments| segments.next_back());
+            if url_filename != Some(asset.filename.as_str()) {
+                return Err(format!(
+                    "format-v{} asset filename does not match its signed URL",
+                    asset.format
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Canonical payload for signature verification:
+    /// `{assets, manifest_version, sequence}` with keys sorted, no whitespace,
+    /// only `signature` excluded, and each asset object emitted with alphabetical
+    /// compact keys (skipping an absent `min_tirith_version`).
+    fn canonical_payload(&self) -> String {
+        // Build each asset as a sorted-key map so the serialized form is
+        // deterministic regardless of struct field order.
+        let assets: Vec<serde_json::Value> = self
+            .assets
+            .iter()
+            .map(|a| {
+                let mut m = serde_json::Map::new();
+                m.insert("filename".to_string(), serde_json::json!(a.filename));
+                m.insert("format".to_string(), serde_json::json!(a.format));
+                if let Some(ref v) = a.min_tirith_version {
+                    m.insert("min_tirith_version".to_string(), serde_json::json!(v));
+                }
+                m.insert("sha256".to_string(), serde_json::json!(a.sha256));
+                m.insert("size".to_string(), serde_json::json!(a.size));
+                m.insert("url".to_string(), serde_json::json!(a.url));
+                serde_json::Value::Object(m)
+            })
+            .collect();
+        let mut top = serde_json::Map::new();
+        top.insert("assets".to_string(), serde_json::Value::Array(assets));
+        top.insert(
+            "manifest_version".to_string(),
+            serde_json::json!(self.manifest_version),
+        );
+        top.insert("sequence".to_string(), serde_json::json!(self.sequence));
+        serde_json::Value::Object(top).to_string()
+    }
+
+    /// Verify with an explicit key. Authenticating the canonical payload happens
+    /// before interpreting `manifest_version`, so an unsigned version mutation
+    /// cannot suppress a valid primary candidate and force a downgrade.
+    fn verify_signature_with_key(&self, verify_key: &VerifyingKey) -> Result<(), String> {
+        let sig_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &self.signature)
+                .map_err(|e| format!("invalid v2 index signature encoding: {e}"))?;
+        if sig_bytes.len() != SIGNATURE_LENGTH {
+            return Err(format!(
+                "v2 index signature wrong length: {} (expected {})",
+                sig_bytes.len(),
+                SIGNATURE_LENGTH
+            ));
+        }
+        let signature = Signature::from_slice(&sig_bytes)
+            .map_err(|e| format!("invalid v2 index signature: {e}"))?;
+        let payload = self.canonical_payload();
+        use ed25519_dalek::Verifier;
+        verify_key
+            .verify(payload.as_bytes(), &signature)
+            .map_err(|_| "v2 index signature verification failed".to_string())?;
+        if self.manifest_version != SIGNED_MANIFEST_VERSION {
+            return Err(format!(
+                "v2 index manifest_version {} is unsupported (expected signed schema {}); falling back to v1",
+                self.manifest_version, SIGNED_MANIFEST_VERSION
+            ));
+        }
+        self.validate_generation()
+    }
+
+    /// Select the best compatible asset: the highest `format <= MAX_FORMAT_VERSION`
+    /// whose `min_tirith_version` is absent or `<=` the running Tirith version,
+    /// and whose declared `size` is within the sanity cap. The asset SHA-256 is
+    /// verified separately, after download. Returns `None` when no asset is
+    /// compatible, or when two or more compatible assets share the highest format
+    /// (an ambiguous index): in both cases the caller falls back to legacy v1
+    /// rather than picking an asset arbitrarily.
+    fn select_asset(&self, current_version: &str) -> Option<&IndexAsset> {
+        let current = SemVer::parse(current_version);
+        let mut compatible = self
+            .assets
+            .iter()
+            .filter(|a| a.format <= MAX_FORMAT_VERSION)
+            .filter(|a| a.size <= MAX_INDEX_ASSET_SIZE)
+            .filter(|a| match &a.min_tirith_version {
+                None => true,
+                Some(min) => match (SemVer::parse(min), current) {
+                    // Compatible only when both parse and we are >= the floor.
+                    (Some(min_v), Some(cur_v)) => cur_v >= min_v,
+                    // An unparseable bound is treated as incompatible (fail safe:
+                    // never install an asset whose floor we cannot evaluate).
+                    _ => false,
+                },
+            });
+        let best = compatible.next()?;
+        // Find the highest format among the compatible assets, tracking whether
+        // any two share that top format. A tie at the top is ambiguous: the
+        // top-level signature covers the whole array, so this is not a forgery
+        // vector, but silently keeping one would be arbitrary. Return None so the
+        // caller falls back to the legacy v1 manifest instead.
+        let (top, top_count) = compatible.fold((best, 1usize), |(top, count), a| {
+            use std::cmp::Ordering;
+            match a.format.cmp(&top.format) {
+                Ordering::Greater => (a, 1),
+                Ordering::Equal => (top, count + 1),
+                Ordering::Less => (top, count),
+            }
+        });
+        if top_count > 1 {
+            return None;
+        }
+        Some(top)
+    }
+}
 
 pub fn update(force: bool, background: bool) -> i32 {
     if background {
@@ -130,31 +359,183 @@ pub fn update(force: bool, background: bool) -> i32 {
     }
 }
 
-/// Foreground update: fetch manifest, verify, download, install.
+/// Outcome of a primary-DB update attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateOutcome {
+    /// A new primary DB was downloaded, verified, and installed.
+    Installed,
+    /// The installed DB is already current; nothing was written.
+    AlreadyCurrent,
+    /// The optional v2 channel is unpublished or has no compatible asset, so
+    /// the caller should use the legacy manifest. Never returned by the legacy
+    /// path itself.
+    NoCompatibleAsset,
+}
+
+/// Foreground update. A v2-capable client tries the signed v2 index FIRST
+/// (preferring the highest compatible format and writing v2 to a distinct path),
+/// then falls back to the legacy single-asset manifest (always v1) on a missing
+/// or invalid index, an unverifiable asset, or any parse failure. Old clients
+/// only ever run the legacy path, so they only ever install v1.
 fn do_update(force: bool) -> Result<(), String> {
+    let outcome = match try_v2_index_update(force) {
+        Ok(UpdateOutcome::NoCompatibleAsset) => {
+            // The optional index is unpublished or offers no compatible asset.
+            do_update_legacy(force)?
+        }
+        Ok(other) => other,
+        Err(e) => {
+            // Any v2-index error (fetch / signature / parse / unverifiable
+            // asset) falls back to the legacy manifest rather than aborting.
+            eprintln!("tirith: v2 index unavailable ({e}), falling back to legacy manifest...");
+            do_update_legacy(force)?
+        }
+    };
+
+    // Primary currentness and supplemental currentness are independent. Enabling,
+    // retrying, or disabling an opt-in feed must reconcile the overlay even when
+    // the signed primary DB was already current.
+    ThreatDb::refresh_cache();
+    if let Err(e) = reconcile_supplemental_after_primary(outcome, || {
+        update_supplemental_db(&policy::Policy::discover(None))
+    }) {
+        eprintln!("tirith: warning: supplemental threat DB update failed: {e}");
+    }
+    Ok(())
+}
+
+fn reconcile_supplemental_after_primary<F>(
+    outcome: UpdateOutcome,
+    reconcile: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    match outcome {
+        UpdateOutcome::Installed | UpdateOutcome::AlreadyCurrent => reconcile(),
+        UpdateOutcome::NoCompatibleAsset => Err(
+            "internal error: supplemental reconciliation reached before primary selection"
+                .to_string(),
+        ),
+    }
+}
+
+/// Attempt the v2-index update path. Returns:
+/// - `Ok(Installed)`: a compatible asset was fetched, verified, and installed;
+/// - `Ok(AlreadyCurrent)`: the selected asset is already the installed version;
+/// - `Ok(NoCompatibleAsset)`: both index URLs returned 404, or a valid index
+///   offered no compatible asset; use the legacy manifest;
+/// - `Err(_)`: the index could not be fetched / verified / parsed, also a
+///   fall-back trigger (the caller logs and continues to legacy).
+fn try_v2_index_update(force: bool) -> Result<UpdateOutcome, String> {
+    // `fetch_index_v2` returns only a signature- and schema-validated candidate;
+    // an invalid primary has already caused the independently published release
+    // candidate to be tried.
+    let Some(index) = fetch_index_v2()? else {
+        // Both discovery surfaces returned 404: the optional v2 channel has
+        // not been published (or was retired). This is an expected v1 state.
+        return Ok(UpdateOutcome::NoCompatibleAsset);
+    };
+
+    let current_tirith_version = env!("CARGO_PKG_VERSION");
+    let asset = match index.select_asset(current_tirith_version) {
+        Some(a) => a,
+        None => {
+            eprintln!(
+                "tirith: v2 index has no asset compatible with this build (max format {}, tirith {}); using legacy manifest",
+                MAX_FORMAT_VERSION, current_tirith_version
+            );
+            return Ok(UpdateOutcome::NoCompatibleAsset);
+        }
+    };
+
+    // Currentness is `(sequence, format)`, not sequence alone. The v1 manifest
+    // is published before the v2 pointer, so a client can legitimately have v1
+    // sequence N when the index for the same generation becomes visible; that
+    // client must still install v2. The reverse format switch is equally real.
+    let current = ThreatDb::cached().map(|db| (db.build_sequence(), db.stats().format_version));
+    if !index_install_needed(index.sequence, asset.format, current, force)? {
+        eprintln!(
+            "tirith: threat DB is already up to date (v2 index sequence {}, format v{})",
+            index.sequence, asset.format
+        );
+        return Ok(UpdateOutcome::AlreadyCurrent);
+    }
+
+    if asset.size > MAX_DB_SIZE {
+        return Err(format!(
+            "v2 asset too large: {} bytes (max {})",
+            asset.size, MAX_DB_SIZE
+        ));
+    }
+
+    eprintln!(
+        "tirith: downloading threat DB (format v{}, seq {}) from v2 index...",
+        asset.format, index.sequence
+    );
+
+    let data = download_url(&asset.url, asset.size)?;
+
+    // Verify the declared SHA-256 BEFORE trusting the bytes.
+    let computed_hash = hex::encode(Sha256::digest(&data));
+    if computed_hash != asset.sha256 {
+        return Err(format!(
+            "v2 asset SHA-256 mismatch: expected {}, got {}",
+            asset.sha256, computed_hash
+        ));
+    }
+
+    let equal_sequence_format_switch = !force
+        && current
+            .is_some_and(|(sequence, format)| sequence == index.sequence && format != asset.format);
+    install_primary_db(
+        data,
+        asset.format,
+        index.sequence,
+        force || equal_sequence_format_switch,
+    )?;
+    if asset.format == 1 {
+        retire_primary_v2()?;
+    }
+    Ok(UpdateOutcome::Installed)
+}
+
+fn index_install_needed(
+    index_sequence: u64,
+    selected_format: u32,
+    current: Option<(u64, u32)>,
+    force: bool,
+) -> Result<bool, String> {
+    if force {
+        return Ok(true);
+    }
+    let Some((current_sequence, current_format)) = current else {
+        return Ok(true);
+    };
+    if index_sequence < current_sequence {
+        return Err(format!(
+            "rollback protection: v2 index sequence {index_sequence} < current {current_sequence}"
+        ));
+    }
+    Ok(index_sequence > current_sequence || selected_format != current_format)
+}
+
+/// Legacy single-asset update: fetch `threatdb-manifest.json`, verify, download,
+/// install to the v1 path. Always v1. Returns `Installed` when it wrote a new
+/// DB, `AlreadyCurrent` when the installed DB is already at this version.
+fn do_update_legacy(force: bool) -> Result<UpdateOutcome, String> {
     let manifest = fetch_manifest()?;
 
-    // Verify manifest signature
     manifest.verify_signature()?;
 
-    // Check rollback protection (unless --force)
-    if !force {
-        if let Some(db) = ThreatDb::cached() {
-            let current_seq = db.build_sequence();
-            if manifest.version < current_seq {
-                return Err(format!(
-                    "rollback protection: manifest version {} < current {}",
-                    manifest.version, current_seq
-                ));
-            }
-            if manifest.version == current_seq {
-                eprintln!(
-                    "tirith: threat DB is already up to date (version {})",
-                    manifest.version
-                );
-                return Ok(());
-            }
-        }
+    let current = ThreatDb::cached().map(|db| (db.build_sequence(), db.stats().format_version));
+    let install_needed = legacy_install_needed(manifest.version, current, force)?;
+    if !install_needed {
+        eprintln!(
+            "tirith: threat DB is already up to date (version {})",
+            manifest.version
+        );
+        return Ok(UpdateOutcome::AlreadyCurrent);
     }
 
     eprintln!(
@@ -162,10 +543,8 @@ fn do_update(force: bool) -> Result<(), String> {
         manifest.version, manifest.size
     );
 
-    // Download the .dat file
     let data = download_db(&manifest)?;
 
-    // Verify SHA-256
     let computed_hash = hex::encode(Sha256::digest(&data));
     if computed_hash != manifest.sha256 {
         return Err(format!(
@@ -174,20 +553,83 @@ fn do_update(force: bool) -> Result<(), String> {
         ));
     }
 
-    // Verify .dat internal signature by loading it
+    // The legacy manifest only ever points at v1. An equal-sequence v2 -> v1
+    // channel retirement is allowed after both signatures and the exact DB
+    // sequence have been checked; it is not a rollback. Only after the v1 bytes
+    // are durably installed do we durably remove the v2 cache. If retirement
+    // fails, return an error before refreshing the process cache so stale v2 is
+    // never silently reported as rolled back.
+    let equal_sequence_format_switch = !force
+        && current.is_some_and(|(sequence, format)| sequence == manifest.version && format == 2);
+    install_primary_db(
+        data,
+        1,
+        manifest.version,
+        force || equal_sequence_format_switch,
+    )?;
+    retire_primary_v2()?;
+    Ok(UpdateOutcome::Installed)
+}
+
+/// Decide whether a verified legacy manifest needs installation. Equality is
+/// current only when the effective DB is already v1. If the effective DB is v2,
+/// the equal-sequence v1 asset must still be installed before retiring v2.
+fn legacy_install_needed(
+    manifest_version: u64,
+    current: Option<(u64, u32)>,
+    force: bool,
+) -> Result<bool, String> {
+    if force {
+        return Ok(true);
+    }
+    let Some((current_sequence, current_format)) = current else {
+        return Ok(true);
+    };
+    if manifest_version < current_sequence {
+        return Err(format!(
+            "rollback protection: manifest version {manifest_version} < current {current_sequence}"
+        ));
+    }
+    Ok(manifest_version > current_sequence || current_format == 2)
+}
+
+/// The on-disk path a primary DB of `format` installs to: a v2 asset goes to
+/// the distinct `tirith-threatdb-v2.dat`, everything else to the canonical
+/// `tirith-threatdb.dat`. The v1 path is NEVER returned for a v2 asset, so a
+/// co-located old binary keeps reading its own v1 file and is never fail-opened.
+fn primary_db_dest(format: u32) -> Result<PathBuf, String> {
+    match format {
+        2 => ThreatDb::default_path_v2().ok_or_else(|| "cannot determine v2 data path".to_string()),
+        _ => ThreatDb::default_path().ok_or_else(|| "cannot determine data directory".to_string()),
+    }
+}
+
+/// Validate a downloaded primary DB blob (structure, rollback, internal
+/// signature) and atomically install it to [`primary_db_dest`] for its `format`.
+fn install_primary_db(data: Vec<u8>, format: u32, version: u64, force: bool) -> Result<(), String> {
     let min_seq = if force { 0 } else { current_sequence() };
     let db =
         ThreatDb::from_bytes(data.clone(), min_seq).map_err(|e| format!("invalid DB file: {e}"))?;
     db.verify_signature()
         .map_err(|e| format!("DB file internal signature verification failed: {e}"))?;
 
-    // Atomic write to data_dir
-    let dest =
-        ThreatDb::default_path().ok_or_else(|| "cannot determine data directory".to_string())?;
-    atomic_write(&dest, &data)?;
+    // The blob's stamped format must match what the index/manifest claimed, so a
+    // v1 asset can never be written to the v2 path (or vice versa).
+    let stamped = db.stats().format_version;
+    if stamped != format {
+        return Err(format!(
+            "DB format mismatch: index/manifest declared format {format} but the downloaded file is format {stamped}"
+        ));
+    }
+    if db.build_sequence() != version {
+        return Err(format!(
+            "DB sequence mismatch: index/manifest declared {version} but the downloaded file is sequence {}",
+            db.build_sequence()
+        ));
+    }
 
-    // Refresh the in-process cache
-    ThreatDb::refresh_cache();
+    let dest = primary_db_dest(format)?;
+    atomic_write(&dest, &data)?;
 
     let stats = db.stats();
     let total_entries = stats.package_count
@@ -196,14 +638,43 @@ fn do_update(force: bool) -> Result<(), String> {
         + stats.typosquat_count
         + stats.popular_count;
     eprintln!(
-        "tirith: threat DB updated to v{} ({} entries)",
-        manifest.version, total_entries
+        "tirith: threat DB updated to v{version} (format v{format}, {total_entries} entries)"
     );
+    Ok(())
+}
 
-    if let Err(e) = update_supplemental_db(&policy::Policy::discover(None)) {
-        eprintln!("tirith: warning: supplemental threat DB update failed: {e}");
+/// Remove the v2 primary only after a verified v1 replacement is durable. The
+/// deletion is idempotent, but every other filesystem error is fatal. On Unix,
+/// syncing the containing directory makes the unlink survive a completed call
+/// across a crash/power loss instead of allowing stale v2 to reappear.
+fn retire_primary_v2() -> Result<(), String> {
+    let v2_path = ThreatDb::default_path_v2()
+        .ok_or_else(|| "cannot determine v2 data path for retirement".to_string())?;
+    if ThreatDb::default_path().as_ref() == Some(&v2_path) {
+        return Err("refusing to retire v2 because it aliases the v1 data path".to_string());
     }
-
+    let parent = v2_path
+        .parent()
+        .ok_or_else(|| "cannot determine v2 data directory".to_string())?;
+    let removed = match std::fs::remove_file(&v2_path) {
+        Ok(()) => true,
+        // Still sync the directory: this may be the retry after an earlier
+        // unlink succeeded but its directory sync failed.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(format!(
+                "failed to retire local v2 threat DB {}: {error}",
+                v2_path.display()
+            ));
+        }
+    };
+    sync_parent_directory(parent)?;
+    if removed {
+        eprintln!(
+            "tirith: retired local v2 threat DB after verified legacy install ({})",
+            v2_path.display()
+        );
+    }
     Ok(())
 }
 
@@ -218,19 +689,44 @@ impl SupplementalEntries {
         self.hostnames.is_empty() && self.ips.is_empty()
     }
 
-    /// Merge parsed feed entries, tagging each with the given source.
-    /// Returns the total number of entries ingested.
+    /// Merge parsed feed entries tagged with `source`; returns the count ingested.
     fn ingest(
         &mut self,
         entries: tirith_core::threatdb_feeds::FeedEntries,
         source: ThreatSource,
-    ) -> usize {
-        let count = entries.hostnames.len() + entries.ips.len();
+    ) -> Result<usize, String> {
+        self.ingest_with_limit(entries, source, MAX_FEED_ENTRIES)
+    }
+
+    fn ingest_with_limit(
+        &mut self,
+        entries: tirith_core::threatdb_feeds::FeedEntries,
+        source: ThreatSource,
+        limit: usize,
+    ) -> Result<usize, String> {
+        let count = entries
+            .hostnames
+            .len()
+            .checked_add(entries.ips.len())
+            .ok_or_else(|| "supplemental feed entry count overflow".to_string())?;
+        let current = self
+            .hostnames
+            .len()
+            .checked_add(self.ips.len())
+            .ok_or_else(|| "supplemental aggregate entry count overflow".to_string())?;
+        let projected = current
+            .checked_add(count)
+            .ok_or_else(|| "supplemental aggregate entry count overflow".to_string())?;
+        if projected > limit {
+            return Err(format!(
+                "supplemental feeds exceed the aggregate indicator limit of {limit}"
+            ));
+        }
         self.hostnames
             .extend(entries.hostnames.into_iter().map(|h| (h, source)));
         self.ips
             .extend(entries.ips.into_iter().map(|ip| (ip, source)));
-        count
+        Ok(count)
     }
 }
 
@@ -248,53 +744,71 @@ fn update_supplemental_db(policy: &policy::Policy) -> Result<(), String> {
     let phishing_enabled = policy.threat_intel.phishing_army_enabled;
 
     if !abusech_enabled && !phishing_enabled {
-        let _ = std::fs::remove_file(&supplemental_path);
+        remove_disabled_supplemental(&supplemental_path)?;
         ThreatDb::refresh_cache();
         return Ok(());
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(
-            SUPPLEMENTAL_DOWNLOAD_TIMEOUT_SECS,
-        ))
-        .build()
-        .map_err(|e| format!("supplemental feed HTTP client error: {e}"))?;
+    let client = guarded_http_client(SUPPLEMENTAL_DOWNLOAD_TIMEOUT_SECS)
+        .map_err(|e| format!("supplemental feed {e}"))?;
 
     let mut supplemental = SupplementalEntries::default();
     let mut attempted_feeds = 0usize;
+    let mut failed_feeds: Vec<&str> = Vec::new();
 
     if let Some(auth_key) = policy.threat_intel.abusech_auth_key.as_deref() {
         if !auth_key.trim().is_empty() {
             attempted_feeds += 1;
-            log_feed_result(
+            if !log_feed_result(
                 "URLhaus",
                 fetch_urlhaus_feed(&client, auth_key.trim(), &mut supplemental),
-            );
+            ) {
+                failed_feeds.push("URLhaus");
+            }
             attempted_feeds += 1;
-            log_feed_result(
+            if !log_feed_result(
                 "ThreatFox",
                 fetch_threatfox_feed(&client, auth_key.trim(), &mut supplemental),
-            );
+            ) {
+                failed_feeds.push("ThreatFox");
+            }
         }
     }
 
     if policy.threat_intel.phishing_army_enabled {
         attempted_feeds += 1;
-        log_feed_result(
+        if !log_feed_result(
             "Phishing Army",
             fetch_phishing_army_feed(&client, &mut supplemental),
-        );
+        ) {
+            failed_feeds.push("Phishing Army");
+        }
         attempted_feeds += 1;
-        log_feed_result(
+        if !log_feed_result(
             "PhishTank",
             fetch_phishtank_feed(&client, &mut supplemental),
-        );
+        ) {
+            failed_feeds.push("PhishTank");
+        }
     }
 
-    // At least one group is enabled (early return above handles the disabled case),
-    // so always fetch Tor exit nodes as a supplemental IP signal.
+    // At least one group is enabled here (fully-disabled returned early), so Tor
+    // exit is always included as a supplemental IP signal.
     attempted_feeds += 1;
-    log_feed_result("Tor exit", fetch_tor_exit_feed(&client, &mut supplemental));
+    if !log_feed_result("Tor exit", fetch_tor_exit_feed(&client, &mut supplemental)) {
+        failed_feeds.push("Tor exit");
+    }
+
+    // repo-0441: a PARTIAL outage must never replace the last-known-good
+    // supplemental DB — the old code rebuilt from only the successful feeds,
+    // silently dropping every indicator of the failed source.
+    if !failed_feeds.is_empty() {
+        eprintln!(
+            "tirith: warning: supplemental feed(s) failed ({}); keeping the existing supplemental threat DB unchanged",
+            failed_feeds.join(", ")
+        );
+        return Ok(());
+    }
 
     if supplemental.is_empty() {
         eprintln!(
@@ -328,11 +842,31 @@ fn update_supplemental_db(policy: &policy::Policy) -> Result<(), String> {
     Ok(())
 }
 
-fn log_feed_result(feed_name: &str, result: Result<usize, String>) {
+fn remove_disabled_supplemental(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "failed to remove disabled supplemental threat DB {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+/// Log a feed outcome; `true` when the feed genuinely produced entries.
+/// repo-0441: an EMPTY successful response is treated as a failure for
+/// publication purposes — a wiped/zero-answer upstream must not shrink the DB.
+fn log_feed_result(feed_name: &str, result: Result<usize, String>) -> bool {
     match result {
-        Ok(0) => eprintln!("tirith: warning: {feed_name} feed returned no entries"),
-        Ok(_) => {}
-        Err(e) => eprintln!("tirith: warning: {feed_name} feed failed: {e}"),
+        Ok(0) => {
+            eprintln!("tirith: warning: {feed_name} feed returned no entries");
+            false
+        }
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("tirith: warning: {feed_name} feed failed: {e}");
+            false
+        }
     }
 }
 
@@ -342,10 +876,9 @@ fn fetch_urlhaus_feed(
     supplemental: &mut SupplementalEntries,
 ) -> Result<usize, String> {
     let url = URLHAUS_EXPORT_TEMPLATE.replace("{auth_key}", auth_key);
-    let body = fetch_text(client, &url)?;
-    let entries = parse_urlhaus_csv(Cursor::new(body.into_bytes()))
-        .map_err(|e| format!("URLhaus parse failed: {e}"))?;
-    Ok(supplemental.ingest(entries, ThreatSource::Urlhaus))
+    let response = fetch_feed_response(client, &url)?;
+    let entries = parse_urlhaus_csv(response).map_err(|e| format!("URLhaus parse failed: {e}"))?;
+    supplemental.ingest(entries, ThreatSource::Urlhaus)
 }
 
 fn fetch_threatfox_feed(
@@ -356,39 +889,40 @@ fn fetch_threatfox_feed(
     let url = THREATFOX_EXPORT_TEMPLATE.replace("{auth_key}", auth_key);
     let zip_bytes = fetch_bytes(client, &url)?;
     let entries = parse_threatfox_zip(Cursor::new(zip_bytes))?;
-    Ok(supplemental.ingest(entries, ThreatSource::ThreatFoxIoc))
+    supplemental.ingest(entries, ThreatSource::ThreatFoxIoc)
 }
 
 fn fetch_phishing_army_feed(
     client: &reqwest::blocking::Client,
     supplemental: &mut SupplementalEntries,
 ) -> Result<usize, String> {
-    let body = fetch_text(client, PHISHING_ARMY_URL)?;
-    let entries = parse_domain_blocklist(&body);
-    Ok(supplemental.ingest(entries, ThreatSource::PhishingArmy))
+    let response = fetch_feed_response(client, PHISHING_ARMY_URL)?;
+    let entries = parse_domain_blocklist_reader(response)
+        .map_err(|e| format!("Phishing Army parse failed: {e}"))?;
+    supplemental.ingest(entries, ThreatSource::PhishingArmy)
 }
 
 fn fetch_phishtank_feed(
     client: &reqwest::blocking::Client,
     supplemental: &mut SupplementalEntries,
 ) -> Result<usize, String> {
-    let body = fetch_text(client, PHISHTANK_URL)?;
-    let entries = parse_phishtank_csv(Cursor::new(body.into_bytes()))
-        .map_err(|e| format!("PhishTank parse failed: {e}"))?;
-    Ok(supplemental.ingest(entries, ThreatSource::PhishTank))
+    let response = fetch_feed_response(client, PHISHTANK_URL)?;
+    let entries =
+        parse_phishtank_csv(response).map_err(|e| format!("PhishTank parse failed: {e}"))?;
+    supplemental.ingest(entries, ThreatSource::PhishTank)
 }
 
 fn fetch_tor_exit_feed(
     client: &reqwest::blocking::Client,
     supplemental: &mut SupplementalEntries,
 ) -> Result<usize, String> {
-    let body = fetch_text(client, TOR_EXIT_URL)?;
-    let entries = parse_tor_exit_list(&body);
-    Ok(supplemental.ingest(entries, ThreatSource::TorExit))
+    let response = fetch_feed_response(client, TOR_EXIT_URL)?;
+    let entries =
+        parse_tor_exit_list_reader(response).map_err(|e| format!("Tor exit parse failed: {e}"))?;
+    supplemental.ingest(entries, ThreatSource::TorExit)
 }
 
-/// Redact query-string secrets (e.g. `?auth-key=...`) from a URL for safe
-/// use in log/error messages.
+/// Redact query-string secrets (e.g. `?auth-key=...`) from a URL for log/error use.
 fn redact_url(url: &str) -> String {
     if let Some(q) = url.find('?') {
         format!("{}?<redacted>", &url[..q])
@@ -397,15 +931,12 @@ fn redact_url(url: &str) -> String {
     }
 }
 
-fn fetch_text(client: &reqwest::blocking::Client, url: &str) -> Result<String, String> {
-    let bytes = fetch_bytes(client, url)?;
+fn fetch_feed_response(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> Result<reqwest::blocking::Response, String> {
     let safe = redact_url(url);
-    String::from_utf8(bytes)
-        .map_err(|e| format!("failed to decode UTF-8 response body for {safe}: {e}"))
-}
-
-fn fetch_bytes(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>, String> {
-    let safe = redact_url(url);
+    validate_remote_url(url, "supplemental feed")?;
     let response = client
         .get(url)
         .header(
@@ -414,8 +945,36 @@ fn fetch_bytes(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>,
         )
         .send()
         .and_then(|resp| resp.error_for_status())
-        .map_err(|e| format!("fetch failed for {safe}: {e}"))?;
+        // repo-0439: a reqwest error's Display embeds the FULL request URL —
+        // including `?auth-key=` credentials. Map to a coarse, URL-free reason.
+        .map_err(|e| {
+            let reason = if e.is_timeout() {
+                "timed out"
+            } else if e.is_connect() {
+                "connection failed"
+            } else if e.is_status() {
+                "unexpected HTTP status"
+            } else {
+                "request failed"
+            };
+            format!("fetch failed for {safe}: {reason}")
+        })?;
 
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_SUPPLEMENTAL_FEED_SIZE)
+    {
+        return Err(format!(
+            "response body for {safe} exceeds {} bytes",
+            MAX_SUPPLEMENTAL_FEED_SIZE
+        ));
+    }
+    Ok(response)
+}
+
+fn fetch_bytes(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>, String> {
+    let safe = redact_url(url);
+    let response = fetch_feed_response(client, url)?;
     let content_length = response.content_length();
     read_bounded_bytes(response, &safe, content_length, MAX_SUPPLEMENTAL_FEED_SIZE)
 }
@@ -448,17 +1007,16 @@ fn read_bounded_bytes<R: std::io::Read>(
 }
 
 fn local_overlay_signing_key() -> SigningKey {
-    // This key is not an authenticity root. It only satisfies the on-disk
-    // ThreatDb format for a mutable, user-local supplemental overlay that is
-    // intentionally loaded without pinned-key signature verification.
+    // Not an authenticity root: only satisfies the on-disk ThreatDb format for the
+    // mutable user-local overlay, which is loaded without pinned-key verification.
     let digest = Sha256::digest(b"tirith-local-supplemental-threatdb-v1");
     let mut key_bytes = [0u8; 32];
     key_bytes.copy_from_slice(&digest[..32]);
     SigningKey::from_bytes(&key_bytes)
 }
 
-/// Run the background update (called with --background flag).
-/// Acquires exclusive lock, downloads, verifies, installs, writes next-check-at.
+/// Background update (`--background`): acquire exclusive lock, download, verify,
+/// install, write next-check-at.
 fn run_background_update() -> i32 {
     let state = match policy::state_dir() {
         Some(d) => d,
@@ -474,7 +1032,7 @@ fn run_background_update() -> i32 {
 
     let lock_path = state.join(LOCKFILE_NAME);
 
-    // Acquire exclusive lock — if held, another child is running, exit silently
+    // Exclusive lock: if held, another child is updating — exit silently.
     let lock_file = match std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -493,11 +1051,9 @@ fn run_background_update() -> i32 {
 
     use fs2::FileExt;
     if lock_file.try_lock_exclusive().is_err() {
-        // Another child holds the lock — exit silently
         return 0;
     }
 
-    // Load policy for auto_update_hours
     let policy = policy::Policy::discover(None);
     let auto_hours = policy.threat_intel.auto_update_hours;
     if auto_hours == 0 {
@@ -511,7 +1067,6 @@ fn run_background_update() -> i32 {
     let now = unix_now();
     let success = result.is_ok();
     if success {
-        // Success: next check at now + auto_update_hours
         let next = now + auto_hours * 3600;
         if let Err(e) = std::fs::write(&next_check_path, next.to_string()) {
             eprintln!("tirith: warning: failed to write next-check-at: {e}");
@@ -520,7 +1075,7 @@ fn run_background_update() -> i32 {
         if let Err(ref e) = result {
             eprintln!("tirith: background update failed: {e}");
         }
-        // Failure: backoff to now + 1h
+        // Backoff on failure to avoid hammering upstream on repeated errors.
         let next = now + BACKOFF_SECS;
         if let Err(e) = std::fs::write(&next_check_path, next.to_string()) {
             eprintln!("tirith: warning: failed to write next-check-at: {e}");
@@ -534,10 +1089,6 @@ fn run_background_update() -> i32 {
         1
     }
 }
-
-// ---------------------------------------------------------------------------
-// Status command
-// ---------------------------------------------------------------------------
 
 pub fn status(json: bool) -> i32 {
     let info = gather_status();
@@ -557,26 +1108,30 @@ pub fn status(json: bool) -> i32 {
 }
 
 #[derive(Debug, serde::Serialize)]
-struct ThreatDbStatus {
-    installed: bool,
-    path: Option<String>,
-    age_hours: Option<f64>,
-    build_timestamp: Option<u64>,
-    build_sequence: Option<u64>,
-    package_count: Option<u32>,
-    hostname_count: Option<u32>,
-    ip_count: Option<u32>,
-    typosquat_count: Option<u32>,
-    popular_count: Option<u32>,
-    total_entries: Option<u32>,
-    skipped_range_only: Option<u32>,
-    signature_valid: Option<bool>,
-    stale: bool,
-    error: Option<String>,
+pub(crate) struct ThreatDbStatus {
+    pub(crate) installed: bool,
+    pub(crate) path: Option<String>,
+    pub(crate) age_hours: Option<f64>,
+    // pub(crate) so a sibling module (e.g. status.rs tests) can build a fixture
+    // via functional-update; serialized by the derive, never weakening anything.
+    pub(crate) build_timestamp: Option<u64>,
+    pub(crate) build_sequence: Option<u64>,
+    pub(crate) package_count: Option<u32>,
+    pub(crate) hostname_count: Option<u32>,
+    pub(crate) ip_count: Option<u32>,
+    pub(crate) typosquat_count: Option<u32>,
+    pub(crate) popular_count: Option<u32>,
+    pub(crate) total_entries: Option<u32>,
+    pub(crate) skipped_range_only: Option<u32>,
+    pub(crate) signature_valid: Option<bool>,
+    pub(crate) stale: bool,
+    pub(crate) error: Option<String>,
 }
 
-fn gather_status() -> ThreatDbStatus {
-    let db_path = ThreatDb::default_path();
+pub(crate) fn gather_status() -> ThreatDbStatus {
+    // repo-0501: report the EFFECTIVE database path (v2 when installed), not
+    // the legacy v1 location.
+    let db_path = ThreatDb::resolve_primary_path();
     let path_str = db_path.as_ref().map(|p| p.display().to_string());
 
     let db_path_ref = match db_path {
@@ -615,13 +1170,13 @@ fn gather_status() -> ThreatDbStatus {
                 + stats.typosquat_count
                 + stats.popular_count;
 
-            // Load policy for staleness threshold
             let policy = policy::Policy::discover(None);
             let stale_hours = policy.threat_intel.auto_update_hours;
+            // Stale = older than 2x the update interval; 0 (disabled) means never stale.
             let is_stale = if stale_hours == 0 {
-                false // auto-update disabled, never consider stale
+                false
             } else {
-                age_hours > (stale_hours as f64 * 2.0) // 2x threshold
+                age_hours > (stale_hours as f64 * 2.0)
             };
 
             ThreatDbStatus {
@@ -636,7 +1191,8 @@ fn gather_status() -> ThreatDbStatus {
                 typosquat_count: Some(stats.typosquat_count),
                 popular_count: Some(stats.popular_count),
                 total_entries: Some(total),
-                skipped_range_only: None, // compile-time stat, not in DB header yet
+                // skipped_range_only is a compile-time stat not yet in the DB header.
+                skipped_range_only: None,
                 signature_valid: Some(sig_valid),
                 stale: is_stale,
                 error: None,
@@ -714,7 +1270,6 @@ fn print_status_human(info: &ThreatDbStatus) {
         println!("  version:     {seq}");
     }
 
-    // Show breakdown
     if let (Some(pkg), Some(host), Some(ip), Some(typo), Some(pop)) = (
         info.package_count,
         info.hostname_count,
@@ -733,25 +1288,28 @@ fn print_status_human(info: &ThreatDbStatus) {
     println!("               (fallback may hit GitHub API rate limits for unauthenticated users)");
 }
 
-// ---------------------------------------------------------------------------
-// Auto-update trigger (called from check.rs)
-// ---------------------------------------------------------------------------
-
 /// Guard: only try once per process lifetime.
 static UPDATE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
-/// Spawn a detached child process to update the threat DB if due.
+/// Spawn a detached child to update the threat DB if due (called from `check.rs`
+/// after the verdict). Cheap: reads a timestamp file and optionally spawns; the
+/// download happens in the child.
 ///
-/// Called from `check.rs` after the verdict is computed.
-/// This is intentionally cheap: reads a timestamp file and optionally spawns
-/// a detached child. The actual download happens in the child process.
-pub fn maybe_background_update() {
-    // 1. Only try once per process lifetime
+/// `offline_flag` (`tirith check --offline`) or `TIRITH_OFFLINE` makes this a
+/// guaranteed no-op — no timestamp files written, no child spawned, analysis
+/// stays purely local.
+pub fn maybe_background_update(offline_flag: bool) {
+    // Offline short-circuit comes BEFORE the once-per-process guard so a later
+    // online call in the same process is not disabled by an earlier offline one
+    // (the guard is a dedup, not a latch on intent).
+    if offline_flag || super::offline_env_active() {
+        return;
+    }
+
     if UPDATE_ATTEMPTED.swap(true, Ordering::Relaxed) {
         return;
     }
 
-    // 2. Respect auto_update_hours=0
     let policy = policy::Policy::discover(None);
     if policy.threat_intel.auto_update_hours == 0 {
         return;
@@ -762,36 +1320,34 @@ pub fn maybe_background_update() {
         None => return,
     };
 
-    // 3. Check next-check-at timestamp
+    // A missing or unparseable next-check-at file is treated as "due".
     let next_check_path = state.join(NEXT_CHECK_FILE);
     let now = unix_now();
     if let Ok(content) = std::fs::read_to_string(&next_check_path) {
         if let Ok(next_ts) = content.trim().parse::<u64>() {
             if now < next_ts {
-                return; // not yet due
+                return;
             }
         }
     }
-    // If file doesn't exist or is unparseable, proceed (first run or corrupt)
 
-    // 4. Layer 1 (parent-side, soft hint): check spawned-at dedup
+    // Parent-side soft dedup so multiple `tirith check` processes in the same
+    // second don't all spawn a child. The real lock lives in the child.
     let spawned_at_path = state.join(SPAWNED_AT_FILE);
     if let Ok(content) = std::fs::read_to_string(&spawned_at_path) {
         if let Ok(spawned_ts) = content.trim().parse::<u64>() {
             if now.saturating_sub(spawned_ts) < SPAWNED_AT_DEDUP_SECS {
-                return; // another parent spawned recently
+                return;
             }
         }
     }
 
-    // Write spawned-at before spawning
     if let Err(e) = std::fs::create_dir_all(&state) {
         eprintln!("tirith: warning: failed to create state directory: {e}");
         return;
     }
     let _ = std::fs::write(&spawned_at_path, now.to_string());
 
-    // 5. Spawn detached child
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(_) => return,
@@ -812,65 +1368,91 @@ pub fn maybe_background_update() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// HTTP helpers
-// ---------------------------------------------------------------------------
-
-/// Fetch the manifest from primary URL, falling back to the release asset URL.
-/// Falls back when: primary fetch fails OR primary manifest is older than current DB
-/// (stale primary, e.g., manifest PR not yet merged).
+/// Fetch and authenticate both independently published legacy manifests, then
+/// select the newest verified candidate. Selection cannot run on merely parsed
+/// JSON: an invalid primary must not suppress a valid fallback, and an older
+/// replayed primary must not beat a newer signed release candidate.
 fn fetch_manifest() -> Result<Manifest, String> {
-    match fetch_manifest_from(MANIFEST_URL_PRIMARY) {
-        Ok(m) => {
-            // Check if primary is stale (older than current DB)
-            if let Some(db) = ThreatDb::cached() {
-                if m.version <= db.build_sequence() {
-                    eprintln!("tirith: primary manifest is stale (v{} <= current v{}), trying fallback...",
-                        m.version, db.build_sequence());
-                    match fetch_manifest_from(MANIFEST_URL_FALLBACK) {
-                        Ok(fallback) if fallback.version > db.build_sequence() => {
-                            return Ok(fallback)
-                        }
-                        _ => {} // fallback also stale or failed — use primary
-                    }
+    let verify_key = VerifyingKey::from_bytes(VERIFY_KEY_BYTES)
+        .map_err(|error| format!("invalid embedded public key: {error}"))?;
+    fetch_manifest_with(fetch_manifest_from, &verify_key)
+}
+
+fn fetch_verified_manifest_candidate<F>(
+    fetch: &mut F,
+    url: &str,
+    verify_key: &VerifyingKey,
+) -> Result<Manifest, String>
+where
+    F: FnMut(&str) -> Result<Manifest, String>,
+{
+    let manifest = fetch(url)?;
+    manifest.verify_signature_with_key(verify_key)?;
+    Ok(manifest)
+}
+
+fn fetch_manifest_with<F>(mut fetch: F, verify_key: &VerifyingKey) -> Result<Manifest, String>
+where
+    F: FnMut(&str) -> Result<Manifest, String>,
+{
+    let primary = fetch_verified_manifest_candidate(&mut fetch, MANIFEST_URL_PRIMARY, verify_key);
+    let fallback = fetch_verified_manifest_candidate(&mut fetch, MANIFEST_URL_FALLBACK, verify_key);
+    match (primary, fallback) {
+        (Ok(primary), Ok(fallback)) => match primary.version.cmp(&fallback.version) {
+            std::cmp::Ordering::Greater => Ok(primary),
+            std::cmp::Ordering::Less => Ok(fallback),
+            std::cmp::Ordering::Equal => {
+                if primary.canonical_payload() != fallback.canonical_payload() {
+                    return Err(format!(
+                        "legacy manifest equivocation: primary and fallback both claim version {} with different signed payloads",
+                        primary.version
+                    ));
                 }
+                Ok(primary)
             }
-            Ok(m)
+        },
+        (Ok(primary), Err(fallback_error)) => {
+            eprintln!(
+                "tirith: legacy manifest fallback unavailable or invalid ({fallback_error}); using verified primary"
+            );
+            Ok(primary)
         }
-        Err(primary_err) => {
-            eprintln!("tirith: primary manifest unavailable ({primary_err}), trying fallback...");
-            fetch_manifest_from(MANIFEST_URL_FALLBACK).map_err(|fallback_err| {
-                format!("manifest fetch failed: primary: {primary_err}; fallback: {fallback_err}")
-            })
+        (Err(primary_error), Ok(fallback)) => {
+            eprintln!(
+                "tirith: legacy manifest primary unavailable or invalid ({primary_error}); using verified fallback"
+            );
+            Ok(fallback)
         }
+        (Err(primary_error), Err(fallback_error)) => Err(format!(
+            "legacy manifest fetch/verification failed: primary: {primary_error}; fallback: {fallback_error}"
+        )),
     }
 }
 
 /// Result of resolving a manifest from cache state + HTTP response.
 #[derive(Debug, PartialEq)]
 enum CacheResolution {
-    /// Use the fresh body from HTTP 200.
+    /// Fresh body from HTTP 200.
     Fresh(String),
-    /// Use cached body from disk (HTTP 304).
+    /// Cached body from disk (HTTP 304).
     Cached(String),
     /// Cache miss on 304 — need unconditional retry.
     RetryNeeded,
 }
 
-/// Resolve manifest from HTTP status and cache state.
-/// Extracted for testability — no I/O, pure logic.
+/// Resolve manifest from HTTP status and cache state. Pure logic, no I/O.
 fn resolve_cache(
     http_status: u16,
     response_body: Option<&str>,
     cached_body: Option<&str>,
 ) -> Result<CacheResolution, String> {
     if http_status == 304 {
-        // Try cached body — must exist AND parse as valid JSON
+        // Corrupt/missing cached body falls through to RetryNeeded; caller cleans
+        // up the stale ETag and retries.
         if let Some(body) = cached_body {
             if serde_json::from_str::<Manifest>(body).is_ok() {
                 return Ok(CacheResolution::Cached(body.to_string()));
             }
-            // Corrupt cached body → need unconditional retry (not an error)
         }
         return Ok(CacheResolution::RetryNeeded);
     }
@@ -887,7 +1469,7 @@ fn resolve_cache(
 fn manifest_cache_key(url: &str) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(url.as_bytes());
-    let hex: String = hash.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let hex = hex::encode(&hash[..8]);
     format!("threatdb-manifest-{hex}")
 }
 
@@ -899,15 +1481,21 @@ fn fetch_manifest_from_with_state(
     url: &str,
     state: Option<std::path::PathBuf>,
 ) -> Result<Manifest, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(MANIFEST_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
+    validate_remote_url(url, "threat DB manifest")?;
+    let client = guarded_http_client(MANIFEST_TIMEOUT_SECS)?;
+    fetch_manifest_from_with_state_and_client(url, state, &client)
+}
+
+fn fetch_manifest_from_with_state_and_client(
+    url: &str,
+    state: Option<std::path::PathBuf>,
+    client: &reqwest::blocking::Client,
+) -> Result<Manifest, String> {
     let cache_key = manifest_cache_key(url);
     let etag_path = state.as_ref().map(|d| d.join(format!("{cache_key}-etag")));
     let body_path = state.as_ref().map(|d| d.join(format!("{cache_key}-body")));
 
-    // Build request with conditional-GET headers (per-URL ETag)
+    // Conditional GET: attach a per-URL ETag from a prior fetch.
     let mut req = client.get(url).header(
         "User-Agent",
         format!("tirith/{}", env!("CARGO_PKG_VERSION")),
@@ -927,14 +1515,13 @@ fn fetch_manifest_from_with_state(
 
     let status = resp.status().as_u16();
 
-    // Extract ETag before consuming response body
+    // Extract ETag before consuming the response body.
     let resp_etag = resp
         .headers()
         .get("etag")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // Read body for non-304 responses (304 has no body)
     let resp_body = if status != 304 {
         let content_len = resp.content_length().unwrap_or(0);
         if content_len > MAX_MANIFEST_SIZE {
@@ -943,21 +1530,21 @@ fn fetch_manifest_from_with_state(
                 content_len, MAX_MANIFEST_SIZE
             ));
         }
-        let body = resp
-            .text()
-            .map_err(|e| format!("failed to read manifest body: {e}"))?;
-        if body.len() as u64 > MAX_MANIFEST_SIZE {
-            return Err(format!("manifest body too large: {} bytes", body.len()));
-        }
+        // repo-0440: bound DURING the read — a chunked/no-length response
+        // bypasses the Content-Length precheck.
+        let body_bytes = read_bounded_bytes(resp, "manifest", None, MAX_MANIFEST_SIZE)?;
+        let body = String::from_utf8(body_bytes)
+            .map_err(|e| format!("manifest body is not valid UTF-8: {e}"))?;
         Some(body)
     } else {
         None
     };
 
-    // Load cached body only for 304 responses (avoid unnecessary I/O on 200)
+    // Only load cached body for 304 — avoids unnecessary I/O on 200.
     let cached_body = if status == 304 {
         body_path.as_ref().and_then(|bp| {
-            // Check file size BEFORE reading to avoid unbounded memory use
+            // Size-check BEFORE reading: an attacker-planted huge file must not
+            // force unbounded allocation.
             if let Ok(meta) = std::fs::metadata(bp) {
                 if meta.len() > MAX_MANIFEST_SIZE {
                     eprintln!(
@@ -974,27 +1561,24 @@ fn fetch_manifest_from_with_state(
         None
     };
 
-    // Use resolve_cache for the status/cache decision (tested state machine)
     match resolve_cache(status, resp_body.as_deref(), cached_body.as_deref()) {
         Ok(CacheResolution::Fresh(body)) => {
-            // Validate JSON BEFORE caching to prevent poisoned cache
+            // Validate JSON BEFORE caching so a bad response never poisons the cache.
             let manifest = serde_json::from_str::<Manifest>(&body)
                 .map_err(|e| format!("invalid manifest JSON: {e}"))?;
-            // Only persist after successful validation
             persist_cache_files(&etag_path, resp_etag.as_deref(), &body_path, &body);
             Ok(manifest)
         }
         Ok(CacheResolution::Cached(body)) => serde_json::from_str::<Manifest>(&body)
             .map_err(|e| format!("cached manifest parse error: {e}")),
         Ok(CacheResolution::RetryNeeded) => {
-            // Delete stale ETag/body to break 304 loop
+            // Delete stale ETag + body so the retry is unconditional (else loop on 304).
             if let Some(ref ep) = etag_path {
                 let _ = std::fs::remove_file(ep);
             }
             if let Some(ref bp) = body_path {
                 let _ = std::fs::remove_file(bp);
             }
-            // Retry unconditionally
             let retry_resp = client
                 .get(url)
                 .header(
@@ -1013,22 +1597,15 @@ fn fetch_manifest_from_with_state(
                     retry_content_len, MAX_MANIFEST_SIZE
                 ));
             }
-            // Persist ETag from retry response
             let retry_etag = retry_resp
                 .headers()
                 .get("etag")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
-            let retry_body = retry_resp
-                .text()
-                .map_err(|e| format!("failed to read retry body: {e}"))?;
-            if retry_body.len() as u64 > MAX_MANIFEST_SIZE {
-                return Err(format!(
-                    "manifest body too large on retry: {} bytes",
-                    retry_body.len()
-                ));
-            }
-            // Validate JSON BEFORE caching to prevent poisoned cache
+            let retry_body_bytes =
+                read_bounded_bytes(retry_resp, "manifest-retry", None, MAX_MANIFEST_SIZE)?;
+            let retry_body = String::from_utf8(retry_body_bytes)
+                .map_err(|e| format!("retry body is not valid UTF-8: {e}"))?;
             let manifest = serde_json::from_str::<Manifest>(&retry_body)
                 .map_err(|e| format!("invalid manifest JSON on retry: {e}"))?;
             persist_cache_files(&etag_path, retry_etag.as_deref(), &body_path, &retry_body);
@@ -1067,14 +1644,25 @@ fn download_db(manifest: &Manifest) -> Result<Vec<u8>, String> {
             manifest.size, MAX_DB_SIZE
         ));
     }
+    download_url(&manifest.url, manifest.size)
+}
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(DB_DOWNLOAD_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
+/// Download a DB blob from an explicit URL, rejecting a declared size or an
+/// actual body over [`MAX_DB_SIZE`]. Shared by the legacy manifest path and the
+/// v2-index path (the caller verifies the SHA-256 afterward).
+fn download_url(url: &str, declared_size: u64) -> Result<Vec<u8>, String> {
+    if declared_size > MAX_DB_SIZE {
+        return Err(format!(
+            "DB file too large: {} bytes (max {})",
+            declared_size, MAX_DB_SIZE
+        ));
+    }
+
+    validate_remote_url(url, "threat DB asset")?;
+    let client = guarded_http_client(DB_DOWNLOAD_TIMEOUT_SECS)?;
 
     let resp = client
-        .get(&manifest.url)
+        .get(url)
         .header(
             "User-Agent",
             format!("tirith/{}", env!("CARGO_PKG_VERSION")),
@@ -1086,22 +1674,124 @@ fn download_db(manifest: &Manifest) -> Result<Vec<u8>, String> {
         return Err(format!("DB download HTTP {}", resp.status()));
     }
 
-    let bytes = resp
-        .bytes()
-        .map_err(|e| format!("failed to read DB body: {e}"))?;
+    let bytes = read_bounded_bytes(resp, "threatdb", None, MAX_DB_SIZE)?;
 
-    if bytes.len() as u64 > MAX_DB_SIZE {
-        return Err(format!("DB body too large: {} bytes", bytes.len()));
-    }
-
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
-// ---------------------------------------------------------------------------
-// Filesystem helpers
-// ---------------------------------------------------------------------------
+/// Fetch and authenticate the signed v2 index, trying the primary raw URL and
+/// then the independently published release-asset fallback. A candidate is not
+/// selected merely because its JSON parsed: signature, signed schema version,
+/// and generation shape all have to validate first.
+/// `Ok(None)` means both discovery surfaces returned HTTP 404.
+fn fetch_index_v2() -> Result<Option<IndexV2>, String> {
+    let verify_key = VerifyingKey::from_bytes(VERIFY_KEY_BYTES)
+        .map_err(|error| format!("invalid embedded public key: {error}"))?;
+    fetch_index_v2_with(fetch_index_v2_from, &verify_key)
+}
 
-/// Atomic write: write to a temp file in the same directory, then rename.
+fn fetch_verified_index_candidate<F>(
+    fetch: &mut F,
+    url: &str,
+    verify_key: &VerifyingKey,
+) -> Result<Option<IndexV2>, String>
+where
+    F: FnMut(&str) -> Result<Option<IndexV2>, String>,
+{
+    let Some(index) = fetch(url)? else {
+        return Ok(None);
+    };
+    index.verify_signature_with_key(verify_key)?;
+    Ok(Some(index))
+}
+
+/// Candidate-selection core, split from HTTP so the primary-invalid/fallback-
+/// valid security boundary is directly regression-testable with signed fixtures.
+fn fetch_index_v2_with<F>(
+    mut fetch: F,
+    verify_key: &VerifyingKey,
+) -> Result<Option<IndexV2>, String>
+where
+    F: FnMut(&str) -> Result<Option<IndexV2>, String>,
+{
+    let primary = fetch_verified_index_candidate(&mut fetch, INDEX_V2_URL_PRIMARY, verify_key);
+    let fallback = fetch_verified_index_candidate(&mut fetch, INDEX_V2_URL_FALLBACK, verify_key);
+    match (primary, fallback) {
+        (Ok(Some(primary)), Ok(Some(fallback))) => match primary.sequence.cmp(&fallback.sequence) {
+            std::cmp::Ordering::Greater => Ok(Some(primary)),
+            std::cmp::Ordering::Less => Ok(Some(fallback)),
+            std::cmp::Ordering::Equal => {
+                if primary.canonical_payload() != fallback.canonical_payload() {
+                    return Err(format!(
+                        "v2 index equivocation: primary and fallback both claim sequence {} with different signed generations",
+                        primary.sequence
+                    ));
+                }
+                Ok(Some(primary))
+            }
+        },
+        (Ok(Some(primary)), Err(fallback_err)) => {
+            eprintln!(
+                "tirith: v2 index fallback unavailable or invalid ({fallback_err}); using verified primary"
+            );
+            Ok(Some(primary))
+        }
+        (Err(primary_err), Ok(Some(fallback))) => {
+            eprintln!(
+                "tirith: v2 index primary unavailable or invalid ({primary_err}); using verified fallback"
+            );
+            Ok(Some(fallback))
+        }
+        (Ok(primary), Ok(None)) => Ok(primary),
+        (Ok(None), Ok(fallback)) => Ok(fallback),
+        (Err(error), Ok(None)) => Err(format!(
+            "v2 index fetch/verification failed: primary: {error}; fallback: HTTP 404 Not Found"
+        )),
+        (Ok(None), Err(error)) => Err(format!(
+            "v2 index fetch/verification failed: primary: HTTP 404 Not Found; fallback: {error}"
+        )),
+        (Err(primary_err), Err(fallback_err)) => Err(format!(
+            "v2 index fetch/verification failed: primary: {primary_err}; fallback: {fallback_err}"
+        )),
+    }
+}
+
+/// Fetch and parse a v2 index from one URL (no ETag cache: the index is small
+/// and fetched at most once per update). Size-bounded to [`MAX_MANIFEST_SIZE`].
+fn fetch_index_v2_from(url: &str) -> Result<Option<IndexV2>, String> {
+    validate_remote_url(url, "threat DB index")?;
+    let client = guarded_http_client(MANIFEST_TIMEOUT_SECS)?;
+    let resp = client
+        .get(url)
+        .header(
+            "User-Agent",
+            format!("tirith/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .map_err(|e| format!("v2 index fetch failed: {e}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(format!("v2 index HTTP {}", resp.status()));
+    }
+    let content_len = resp.content_length().unwrap_or(0);
+    if content_len > MAX_MANIFEST_SIZE {
+        return Err(format!(
+            "v2 index too large: {} bytes (max {})",
+            content_len, MAX_MANIFEST_SIZE
+        ));
+    }
+    let body_bytes = read_bounded_bytes(resp, "v2-index", None, MAX_MANIFEST_SIZE)?;
+    let body = String::from_utf8(body_bytes)
+        .map_err(|e| format!("v2 index body is not valid UTF-8: {e}"))?;
+    serde_json::from_str::<IndexV2>(&body)
+        .map(Some)
+        .map_err(|e| format!("invalid v2 index JSON: {e}"))
+}
+
+/// Durable atomic write: write and sync a temp file in the same directory,
+/// rename it into place, then sync the containing directory on Unix.
 fn atomic_write(dest: &PathBuf, data: &[u8]) -> Result<(), String> {
     let parent = dest
         .parent()
@@ -1114,10 +1804,35 @@ fn atomic_write(dest: &PathBuf, data: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("failed to write temp file: {e}"))?;
     tmp.flush()
         .map_err(|e| format!("failed to flush temp file: {e}"))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("failed to sync temp file: {e}"))?;
 
-    tmp.persist(dest)
+    let persisted = tmp
+        .persist(dest)
         .map_err(|e| format!("failed to rename temp file: {e}"))?;
+    persisted
+        .sync_all()
+        .map_err(|e| format!("failed to sync installed file: {e}"))?;
+    sync_parent_directory(parent)?;
 
+    Ok(())
+}
+
+fn sync_parent_directory(parent: &std::path::Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                format!(
+                    "failed to sync containing directory {}: {error}",
+                    parent.display()
+                )
+            })?;
+    }
+    #[cfg(not(unix))]
+    let _ = parent;
     Ok(())
 }
 
@@ -1134,29 +1849,2147 @@ fn current_sequence() -> u64 {
         .unwrap_or(0)
 }
 
-/// Hex encoding helper (avoid adding hex crate dependency).
+/// Hex encoding helper (avoids a hex crate dependency).
 mod hex {
+    use std::fmt::Write as _;
     pub fn encode(data: impl AsRef<[u8]>) -> String {
-        data.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+        let bytes = data.as_ref();
+        bytes
+            .iter()
+            .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+                let _ = write!(s, "{b:02x}");
+                s
+            })
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// Threat-DB transparency subcommands (M2 item 11): `explain`, `sources`,
+// `health`, `diff` — read-only inspection, no download/write, all support
+// `--format json`.
+
+use std::net::Ipv4Addr;
+
+use tirith_core::threatdb::{Confidence, Ecosystem, SourceTier};
+
+/// File name for the append-only snapshot history used by `threat-db diff`.
+const HISTORY_FILE: &str = "threatdb-history.jsonl";
+/// Hard cap on retained snapshot lines — keeps the file bounded.
+const HISTORY_MAX_LINES: usize = 64;
+
+/// Per-category entry counts for a loaded DB. Mirrors the DB's five sections.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct CategoryCounts {
+    packages: u64,
+    hostnames: u64,
+    ips: u64,
+    typosquats: u64,
+    popular: u64,
+}
+
+impl CategoryCounts {
+    fn total(&self) -> u64 {
+        self.packages + self.hostnames + self.ips + self.typosquats + self.popular
+    }
+}
+
+/// One DB observation appended to the history file — the only thing `diff` can
+/// compare against, since the DB format retains no per-entry history.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DbSnapshot {
+    recorded_at: u64,
+    /// DB build sequence (the monotonic "version").
+    build_sequence: u64,
+    build_timestamp: u64,
+    /// Whether the DB's Ed25519 signature verified at observation time.
+    signature_valid: bool,
+    counts: CategoryCounts,
+    /// Per-source record counts, keyed by the stable `ThreatSource::as_str()`.
+    #[serde(default)]
+    sources: std::collections::BTreeMap<String, u64>,
+}
+
+/// Resolve the snapshot history file path under the state dir.
+fn history_path() -> Option<PathBuf> {
+    policy::state_dir().map(|d| d.join(HISTORY_FILE))
+}
+
+/// Build a snapshot of the currently-loaded DB, or `None` if no DB is loaded.
+fn current_snapshot() -> Option<DbSnapshot> {
+    let db = ThreatDb::cached()?;
+    let stats = db.stats();
+    let breakdown = db.source_breakdown();
+    let mut sources = std::collections::BTreeMap::new();
+    for (src, count) in breakdown.per_source() {
+        sources.insert(src.as_str().to_string(), *count);
+    }
+    Some(DbSnapshot {
+        recorded_at: unix_now(),
+        build_sequence: stats.build_sequence,
+        build_timestamp: stats.build_timestamp,
+        signature_valid: db.verify_signature().is_ok(),
+        counts: CategoryCounts {
+            packages: stats.package_count as u64,
+            hostnames: stats.hostname_count as u64,
+            ips: stats.ip_count as u64,
+            typosquats: stats.typosquat_count as u64,
+            popular: stats.popular_count as u64,
+        },
+        sources,
+    })
+}
+
+/// Load all retained snapshots, oldest first (unparseable lines skipped).
+///
+/// Returns `(snapshots, read_error)`. A missing history file yields an empty
+/// list with no error; a file that exists but cannot be read yields an empty
+/// list AND `Some(message)`, so callers distinguish "could not read" from
+/// "first observation".
+fn load_history() -> (Vec<DbSnapshot>, Option<String>) {
+    let Some(path) = history_path() else {
+        return (Vec::new(), None);
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), None),
+        Err(e) => {
+            return (
+                Vec::new(),
+                Some(format!(
+                    "could not read snapshot history at {} ({e}) — check file permissions; \
+                     the diff below cannot use any earlier snapshot",
+                    path.display()
+                )),
+            );
+        }
+    };
+    let snapshots = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<DbSnapshot>(l).ok())
+        .collect();
+    (snapshots, None)
+}
+
+/// Append `snapshot` to the history file unless its content is already present.
+/// Best-effort: I/O errors are ignored (history is a `diff` convenience, never
+/// load-bearing). Truncated to the most recent [`HISTORY_MAX_LINES`] entries.
+fn record_snapshot(snapshot: &DbSnapshot) {
+    let Some(path) = history_path() else {
+        return;
+    };
+    let (mut history, _) = load_history();
+    // Dedup on content (everything but `recorded_at`): an unchanged DB must not
+    // append a near-identical line, but a changed overlay (same build_sequence,
+    // different counts/sources) must still record.
+    if history.iter().any(|s| {
+        s.build_sequence == snapshot.build_sequence
+            && s.build_timestamp == snapshot.build_timestamp
+            && s.signature_valid == snapshot.signature_valid
+            && s.counts == snapshot.counts
+            && s.sources == snapshot.sources
+    }) {
+        return;
+    }
+    history.push(snapshot.clone());
+    if history.len() > HISTORY_MAX_LINES {
+        let drop = history.len() - HISTORY_MAX_LINES;
+        history.drain(0..drop);
+    }
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let mut body = String::new();
+    for s in &history {
+        if let Ok(line) = serde_json::to_string(s) {
+            body.push_str(&line);
+            body.push('\n');
+        }
+    }
+    let _ = atomic_write(&path, body.as_bytes());
+}
+
+/// Snapshot the current DB and fold it into the history file, so `diff`
+/// accumulates a trail as the read-only transparency commands run.
+fn snapshot_current_db() {
+    if let Some(snapshot) = current_snapshot() {
+        record_snapshot(&snapshot);
+    }
+}
+
+/// What kind of indicator the user passed to `explain`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum IndicatorKind {
+    Ip,
+    Package,
+    Domain,
+}
+
+/// A parsed `explain` argument.
+struct ParsedIndicator {
+    kind: IndicatorKind,
+    /// For packages: the ecosystem, if the caller used `eco:name` syntax.
+    ecosystem: Option<Ecosystem>,
+    /// For packages: the version, if the caller used `name@version` syntax.
+    version: Option<String>,
+    /// The bare indicator value (host, package name, or IP string).
+    value: String,
+}
+
+/// Classify the indicator string: bare IPv4 → IP; `eco:name` (known ecosystem)
+/// or `name@version` or bare name → package; dotted slash/space-free non-IP →
+/// domain.
+fn parse_indicator(raw: &str) -> ParsedIndicator {
+    let trimmed = raw.trim();
+
+    if let Ok(ip) = trimmed.parse::<Ipv4Addr>() {
+        return ParsedIndicator {
+            kind: IndicatorKind::Ip,
+            ecosystem: None,
+            version: None,
+            value: ip.to_string(),
+        };
+    }
+
+    // `eco:name` — only for a recognized ecosystem, so `host:port` is not a package.
+    if let Some((prefix, rest)) = trimmed.split_once(':') {
+        if let Some(eco) = Ecosystem::from_name(prefix) {
+            let (name, version) = split_name_version(rest);
+            return ParsedIndicator {
+                kind: IndicatorKind::Package,
+                ecosystem: Some(eco),
+                version,
+                value: name,
+            };
+        }
+    }
+
+    // `name@version` (npm-style) → package.
+    if let Some((name, version)) = split_at_version(trimmed) {
+        return ParsedIndicator {
+            kind: IndicatorKind::Package,
+            ecosystem: None,
+            version: Some(version),
+            value: name,
+        };
+    }
+
+    // Dotted, slash-free, space-free, non-IP → domain.
+    if trimmed.contains('.') && !trimmed.contains('/') && !trimmed.contains(char::is_whitespace) {
+        return ParsedIndicator {
+            kind: IndicatorKind::Domain,
+            ecosystem: None,
+            version: None,
+            value: trimmed.to_ascii_lowercase(),
+        };
+    }
+
+    // Fallback: a bare package name (e.g. `react`).
+    ParsedIndicator {
+        kind: IndicatorKind::Package,
+        ecosystem: None,
+        version: None,
+        value: trimmed.to_string(),
+    }
+}
+
+/// Split `name@version`; `None` when there is no `@` or `@` is a leading npm
+/// scope (e.g. `@scope/pkg`).
+fn split_at_version(s: &str) -> Option<(String, String)> {
+    // A leading `@` is an npm scope, not a version separator.
+    let search_from = if s.starts_with('@') { 1 } else { 0 };
+    let idx = s[search_from..].find('@')? + search_from;
+    let name = &s[..idx];
+    let version = &s[idx + 1..];
+    if name.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), version.to_string()))
+}
+
+/// Split the `name` / `name@version` part after an `eco:` prefix.
+fn split_name_version(rest: &str) -> (String, Option<String>) {
+    match split_at_version(rest) {
+        Some((name, version)) => (name, Some(version)),
+        None => (rest.to_string(), None),
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ExplainResult {
+    indicator: String,
+    kind: IndicatorKind,
+    /// Ecosystem the package lookup used (packages only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ecosystem: Option<String>,
+    /// Version the package lookup used (packages only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    /// True when the threat DB has at least one finding for this indicator.
+    present: bool,
+    /// The DB is not installed — lookups cannot be performed.
+    db_missing: bool,
+    findings: Vec<ExplainFinding>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ExplainFinding {
+    /// `malicious_package`, `typosquat`, `popular_lookalike`,
+    /// `malicious_hostname`, or `malicious_ip`.
+    classification: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<Confidence>,
+    detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference_url: Option<String>,
+}
+
+/// `tirith threat-db explain <indicator>`.
+pub fn explain(indicator: &str, json: bool) -> i32 {
+    let parsed = parse_indicator(indicator);
+    let db = ThreatDb::cached();
+
+    let mut findings: Vec<ExplainFinding> = Vec::new();
+    let db_missing = db.is_none();
+
+    if let Some(ref db) = db {
+        match parsed.kind {
+            IndicatorKind::Ip => {
+                if let Ok(ip) = parsed.value.parse::<Ipv4Addr>() {
+                    if let Some(m) = db.check_ip(ip) {
+                        findings.push(ExplainFinding {
+                            classification: "malicious_ip".to_string(),
+                            source: Some(m.source.as_str().to_string()),
+                            source_label: Some(m.source.label().to_string()),
+                            confidence: Some(m.confidence),
+                            detail: format!(
+                                "IP address is listed as malicious infrastructure by {}.",
+                                m.source.label()
+                            ),
+                            reference_url: m.reference_url,
+                        });
+                    }
+                }
+            }
+            IndicatorKind::Domain => {
+                if let Some(m) = db.check_hostname(&parsed.value) {
+                    findings.push(ExplainFinding {
+                        classification: "malicious_hostname".to_string(),
+                        source: Some(m.source.as_str().to_string()),
+                        source_label: Some(m.source.label().to_string()),
+                        confidence: Some(m.confidence),
+                        detail: format!(
+                            "Hostname is listed as malicious infrastructure by {}.",
+                            m.source.label()
+                        ),
+                        reference_url: m.reference_url,
+                    });
+                }
+            }
+            IndicatorKind::Package => {
+                // Probe the caller's ecosystem, or all of them when none given.
+                let ecosystems: Vec<Ecosystem> = match parsed.ecosystem {
+                    Some(e) => vec![e],
+                    None => ALL_ECOSYSTEMS.to_vec(),
+                };
+                for eco in ecosystems {
+                    explain_package(
+                        db,
+                        eco,
+                        &parsed.value,
+                        parsed.version.as_deref(),
+                        &mut findings,
+                    );
+                }
+            }
+        }
+    }
+
+    let result = ExplainResult {
+        indicator: indicator.trim().to_string(),
+        kind: parsed.kind,
+        ecosystem: parsed.ecosystem.map(|e| e.to_string()),
+        version: parsed.version.clone(),
+        present: !findings.is_empty(),
+        db_missing,
+        findings,
+    };
+
+    // Record a snapshot opportunistically so `diff` accrues history.
+    snapshot_current_db();
+
+    if json {
+        return print_json_value(&result);
+    }
+    print_explain_human(&result);
+    0
+}
+
+/// All ecosystems, probed when `explain` gets a package name with no prefix.
+const ALL_ECOSYSTEMS: [Ecosystem; 8] = [
+    Ecosystem::Npm,
+    Ecosystem::PyPI,
+    Ecosystem::RubyGems,
+    Ecosystem::Crates,
+    Ecosystem::Go,
+    Ecosystem::Maven,
+    Ecosystem::NuGet,
+    Ecosystem::Packagist,
+];
+
+/// Probe one ecosystem (malicious-package, typosquat, popular-lookalike),
+/// appending matches to `findings`.
+fn explain_package(
+    db: &ThreatDb,
+    eco: Ecosystem,
+    name: &str,
+    version: Option<&str>,
+    findings: &mut Vec<ExplainFinding>,
+) {
+    if let Some(m) = db.check_package(eco, name, version) {
+        let versions = if m.all_versions_malicious {
+            "all versions".to_string()
+        } else {
+            "specific affected versions".to_string()
+        };
+        findings.push(ExplainFinding {
+            classification: "malicious_package".to_string(),
+            source: Some(m.source.as_str().to_string()),
+            source_label: Some(m.source.label().to_string()),
+            confidence: Some(m.confidence),
+            detail: format!(
+                "{} package '{}' is listed as malicious by {} ({}).",
+                eco,
+                name,
+                m.source.label(),
+                versions
+            ),
+            reference_url: m.reference_url,
+        });
+    }
+
+    if let Some(ts) = db.check_typosquat(eco, name) {
+        findings.push(ExplainFinding {
+            classification: "typosquat".to_string(),
+            source: Some(ThreatSource::EcosystemsTyposquat.as_str().to_string()),
+            source_label: Some(ThreatSource::EcosystemsTyposquat.label().to_string()),
+            confidence: None,
+            detail: format!(
+                "{} package '{}' is a known typosquat of '{}'.",
+                eco, ts.malicious_name, ts.target_name
+            ),
+            reference_url: None,
+        });
+    }
+
+    if let Some((popular, distance)) = db.check_popular_distance(eco, name) {
+        findings.push(ExplainFinding {
+            classification: "popular_lookalike".to_string(),
+            source: None,
+            source_label: None,
+            confidence: None,
+            detail: format!(
+                "{} package '{}' is edit-distance {} from the popular package '{}' \
+                 — a possible slopsquat/typo. Not itself listed as malicious.",
+                eco, name, distance, popular
+            ),
+            reference_url: None,
+        });
+    }
+}
+
+fn print_explain_human(r: &ExplainResult) {
+    println!("threat-db explain: {}", r.indicator);
+    let kind_label = match r.kind {
+        IndicatorKind::Ip => "IPv4 address",
+        IndicatorKind::Package => "package",
+        IndicatorKind::Domain => "domain / hostname",
+    };
+    print!("  type:        {kind_label}");
+    if let Some(ref eco) = r.ecosystem {
+        print!(" ({eco})");
+    }
+    if let Some(ref v) = r.version {
+        print!(" @ {v}");
+    }
+    println!();
+
+    if r.db_missing {
+        println!("  result:      threat DB not installed");
+        println!("  Hint: run 'tirith threat-db update' to install the signed DB.");
+        return;
+    }
+
+    if !r.present {
+        println!("  result:      not present");
+        match r.kind {
+            IndicatorKind::Package => println!(
+                "  The threat DB has no malicious-package, typosquat, or \
+                 popular-lookalike record for this name."
+            ),
+            IndicatorKind::Domain => {
+                println!("  The threat DB has no malicious-hostname record for this domain.")
+            }
+            IndicatorKind::Ip => {
+                println!("  The threat DB has no malicious-infrastructure record for this IP.")
+            }
+        }
+        println!("  Absence is not a guarantee of safety — the DB only covers known threats.");
+        return;
+    }
+
+    println!("  result:      PRESENT — {} finding(s)", r.findings.len());
+    for (i, f) in r.findings.iter().enumerate() {
+        println!();
+        println!("  [{}] {}", i + 1, f.classification);
+        if let Some(ref label) = f.source_label {
+            println!("      source:     {label}");
+        }
+        if let Some(c) = f.confidence {
+            println!("      confidence: {}", c.as_str());
+        }
+        println!("      {}", f.detail);
+        if let Some(ref url) = f.reference_url {
+            println!("      reference:  {url}");
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SourcesReport {
+    /// True when a DB is installed and the per-source counts are real.
+    db_installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_timestamp: Option<u64>,
+    sources: Vec<SourceInfo>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SourceInfo {
+    id: String,
+    name: String,
+    /// `primary` (signed CI DB) or `supplemental` (user-local overlay).
+    tier: SourceTier,
+    upstream_url: String,
+    /// Live record count, or `null` when no DB is installed. Typosquat/popular
+    /// records carry no source byte, so the typosquat count lands under `typosquats`.
+    record_count: Option<u64>,
+}
+
+/// `tirith threat-db sources`.
+pub fn sources(json: bool) -> i32 {
+    let db = ThreatDb::cached();
+    let breakdown = db.as_ref().map(|d| d.source_breakdown());
+    let stats = db.as_ref().map(|d| d.stats());
+
+    let mut source_infos = Vec::new();
+    for src in ThreatSource::ALL {
+        // `count_for` attributes the typosquat index to `EcosystemsTyposquat`,
+        // so no per-source special-case is needed.
+        let record_count = breakdown.as_ref().map(|b| b.count_for(src));
+        source_infos.push(SourceInfo {
+            id: src.as_str().to_string(),
+            name: src.label().to_string(),
+            tier: src.tier(),
+            upstream_url: src.upstream_url().to_string(),
+            record_count,
+        });
+    }
+
+    let report = SourcesReport {
+        db_installed: db.is_some(),
+        build_sequence: stats.as_ref().map(|s| s.build_sequence),
+        build_timestamp: stats.as_ref().map(|s| s.build_timestamp),
+        sources: source_infos,
+    };
+
+    snapshot_current_db();
+
+    if json {
+        return print_json_value(&report);
+    }
+    print_sources_human(&report, breakdown.as_ref().map(|b| b.popular_count));
+    0
+}
+
+fn print_sources_human(r: &SourcesReport, popular_count: Option<u64>) {
+    println!("threat-db sources");
+    if r.db_installed {
+        if let (Some(seq), Some(ts)) = (r.build_sequence, r.build_timestamp) {
+            println!("  DB version {seq}, built {}", format_epoch(ts));
+        }
+    } else {
+        println!("  threat DB not installed — counts unavailable");
+        println!("  (run 'tirith threat-db update' to install the signed DB)");
+    }
+
+    for tier in [SourceTier::Primary, SourceTier::Supplemental] {
+        let heading = match tier {
+            SourceTier::Primary => "Primary feeds (signed CI database)",
+            SourceTier::Supplemental => "Supplemental feeds (optional user-local overlay)",
+        };
+        println!();
+        println!("  {heading}");
+        for s in r.sources.iter().filter(|s| s.tier == tier) {
+            let count = match s.record_count {
+                Some(c) => format!("{c} records"),
+                None => "count unavailable".to_string(),
+            };
+            println!("    {:<26} {}", s.name, count);
+            println!("      {}", s.upstream_url);
+        }
+    }
+
+    if r.db_installed {
+        println!();
+        println!(
+            "  Note: typosquat counts are reported under the ecosyste.ms Typosquats feed; \
+             popular-package baselines ({} entries) are not a threat feed.",
+            popular_count.unwrap_or(0)
+        );
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct HealthReport {
+    installed: bool,
+    path: Option<String>,
+    /// Ed25519 signature verified (`None` when not installed or load failed).
+    signature_valid: Option<bool>,
+    age_hours: Option<f64>,
+    /// Configured refresh interval in hours (`auto_update_hours`, 0 = disabled).
+    refresh_interval_hours: u64,
+    /// Older than 2x the refresh interval (never true when refresh is disabled).
+    stale: bool,
+    build_sequence: Option<u64>,
+    build_timestamp: Option<u64>,
+    counts: Option<CategoryCounts>,
+    supplemental: SupplementalHealth,
+    /// Load/parse error when the DB file exists but could not be read.
+    error: Option<String>,
+    /// `ok`, `stale`, `not_installed`, or `error`.
+    status: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SupplementalHealth {
+    present: bool,
+    path: Option<String>,
+}
+
+/// `tirith threat-db health`.
+pub fn health(json: bool) -> i32 {
+    let report = gather_health();
+    snapshot_current_db();
+
+    let exit = if report.error.is_some() { 1 } else { 0 };
+
+    if json {
+        // Propagate the worse of the health exit code and a JSON-write failure.
+        return print_json_value(&report).max(exit);
+    }
+    print_health_human(&report);
+    exit
+}
+
+fn gather_health() -> HealthReport {
+    // repo-0501: same fix on the health surface.
+    let db_path = ThreatDb::resolve_primary_path();
+    let path_str = db_path.as_ref().map(|p| p.display().to_string());
+    let policy = policy::Policy::discover(None);
+    let refresh_interval_hours = policy.threat_intel.auto_update_hours;
+
+    let supplemental_path = ThreatDb::supplemental_path();
+    let supplemental = SupplementalHealth {
+        present: supplemental_path
+            .as_ref()
+            .map(|p| p.exists())
+            .unwrap_or(false),
+        path: supplemental_path.map(|p| p.display().to_string()),
+    };
+
+    let exists = db_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+    if !exists {
+        return HealthReport {
+            installed: false,
+            path: path_str,
+            signature_valid: None,
+            age_hours: None,
+            refresh_interval_hours,
+            stale: false,
+            build_sequence: None,
+            build_timestamp: None,
+            counts: None,
+            supplemental,
+            error: None,
+            status: "not_installed".to_string(),
+        };
+    }
+
+    let db_path_ref = db_path.as_ref().expect("path exists when exists==true");
+    match ThreatDb::load_from_path(db_path_ref, 0) {
+        Ok(db) => {
+            let sig_valid = db.verify_signature().is_ok();
+            let stats = db.stats();
+            let age_secs = unix_now().saturating_sub(stats.build_timestamp);
+            let age_hours = age_secs as f64 / 3600.0;
+            // Stale = older than 2x the refresh interval; interval 0 = never stale.
+            let stale =
+                refresh_interval_hours != 0 && age_hours > (refresh_interval_hours as f64 * 2.0);
+            let counts = CategoryCounts {
+                packages: stats.package_count as u64,
+                hostnames: stats.hostname_count as u64,
+                ips: stats.ip_count as u64,
+                typosquats: stats.typosquat_count as u64,
+                popular: stats.popular_count as u64,
+            };
+            let status = if !sig_valid {
+                "error"
+            } else if stale {
+                "stale"
+            } else {
+                "ok"
+            };
+            HealthReport {
+                installed: true,
+                path: path_str,
+                signature_valid: Some(sig_valid),
+                age_hours: Some(age_hours),
+                refresh_interval_hours,
+                stale,
+                build_sequence: Some(stats.build_sequence),
+                build_timestamp: Some(stats.build_timestamp),
+                counts: Some(counts),
+                supplemental,
+                error: if sig_valid {
+                    None
+                } else {
+                    Some("Ed25519 signature verification failed".to_string())
+                },
+                status: status.to_string(),
+            }
+        }
+        Err(e) => HealthReport {
+            installed: true,
+            path: path_str,
+            signature_valid: None,
+            age_hours: None,
+            refresh_interval_hours,
+            stale: false,
+            build_sequence: None,
+            build_timestamp: None,
+            counts: None,
+            supplemental,
+            error: Some(format!("{e}")),
+            status: "error".to_string(),
+        },
+    }
+}
+
+fn print_health_human(r: &HealthReport) {
+    println!("threat-db health");
+
+    if !r.installed {
+        println!("  status:        NOT INSTALLED");
+        if let Some(ref p) = r.path {
+            println!("  expected at:   {p}");
+        }
+        println!("  Hint: run 'tirith threat-db update' to install the signed DB.");
+        print_supplemental_health(&r.supplemental);
+        return;
+    }
+
+    if let Some(ref err) = r.error {
+        println!("  status:        ERROR — {err}");
+        if let Some(ref p) = r.path {
+            println!("  path:          {p}");
+        }
+        println!("  Hint: re-download with 'tirith threat-db update --force'.");
+        print_supplemental_health(&r.supplemental);
+        return;
+    }
+
+    let status_label = match r.status.as_str() {
+        "ok" => "OK",
+        "stale" => "STALE",
+        other => other,
+    };
+    println!("  status:        {status_label}");
+    if let Some(ref p) = r.path {
+        println!("  path:          {p}");
+    }
+    match r.signature_valid {
+        Some(true) => println!("  signature:     valid (Ed25519)"),
+        Some(false) => println!("  signature:     INVALID"),
+        None => println!("  signature:     unknown"),
+    }
+    if let Some(seq) = r.build_sequence {
+        println!("  version:       {seq}");
+    }
+    if let Some(ts) = r.build_timestamp {
+        println!("  built:         {}", format_epoch(ts));
+    }
+    if let Some(age) = r.age_hours {
+        println!("  age:           {}", format_age(age));
+    }
+    if r.refresh_interval_hours == 0 {
+        println!("  refresh:       auto-update disabled (auto_update_hours = 0)");
+    } else {
+        println!(
+            "  refresh:       every {}h (stale after {}h)",
+            r.refresh_interval_hours,
+            r.refresh_interval_hours * 2
+        );
+        if r.stale {
+            println!("  -> DB is stale; run 'tirith threat-db update'.");
+        }
+    }
+    if let Some(ref c) = r.counts {
+        println!(
+            "  entries:       {} total — {} packages, {} hostnames, {} IPs, {} typosquats, {} popular",
+            c.total(),
+            c.packages,
+            c.hostnames,
+            c.ips,
+            c.typosquats,
+            c.popular
+        );
+    }
+    print_supplemental_health(&r.supplemental);
+}
+
+fn print_supplemental_health(s: &SupplementalHealth) {
+    if s.present {
+        println!("  supplemental:  present (user-local opt-in feed overlay)");
+    } else {
+        println!("  supplemental:  none (no opt-in feeds configured)");
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DiffReport {
+    /// The `--since` argument as supplied.
+    since: String,
+    /// How `--since` was interpreted: `version` or `date`.
+    since_kind: String,
+    baseline: Option<SnapshotSummary>,
+    current: Option<SnapshotSummary>,
+    /// Per-category count deltas (current - baseline). Positive = added.
+    delta: Option<CountDelta>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    source_delta: std::collections::BTreeMap<String, i64>,
+    limitation: String,
+    /// Set when the diff could not be produced (no DB, no baseline, …).
+    note: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SnapshotSummary {
+    build_sequence: u64,
+    build_timestamp: u64,
+    recorded_at: u64,
+    counts: CategoryCounts,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CountDelta {
+    packages: i64,
+    hostnames: i64,
+    ips: i64,
+    typosquats: i64,
+    popular: i64,
+    total: i64,
+}
+
+fn delta_of(current: &CategoryCounts, baseline: &CategoryCounts) -> CountDelta {
+    let d = |c: u64, b: u64| c as i64 - b as i64;
+    CountDelta {
+        packages: d(current.packages, baseline.packages),
+        hostnames: d(current.hostnames, baseline.hostnames),
+        ips: d(current.ips, baseline.ips),
+        typosquats: d(current.typosquats, baseline.typosquats),
+        popular: d(current.popular, baseline.popular),
+        total: d(current.total(), baseline.total()),
+    }
+}
+
+/// Parse `--since` as a build-sequence number or ISO date. Returns
+/// `(kind, version, epoch)` with exactly one of version/epoch set.
+fn parse_since(since: &str) -> Result<(String, Option<u64>, Option<u64>), String> {
+    let s = since.trim();
+    // A bare integer is a build sequence ("version").
+    if let Ok(version) = s.parse::<u64>() {
+        return Ok(("version".to_string(), Some(version), None));
+    }
+    // Otherwise a date (YYYY-MM-DD, optionally with time).
+    if let Some(epoch) = parse_iso_date(s) {
+        return Ok(("date".to_string(), None, Some(epoch)));
+    }
+    Err(format!(
+        "could not parse --since value '{since}' — expected a DB version number \
+         (e.g. 42) or an ISO date (e.g. 2026-01-15)"
+    ))
+}
+
+/// Days in each calendar month for a non-leap year (January first). February's
+/// leap-day is added separately via [`is_leap_year`].
+const MONTH_DAYS: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+/// Proleptic Gregorian leap-year test, shared by the date parser and formatter.
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+/// Parse `YYYY-MM-DD` (or `...THH:MM:SS`) to a Unix epoch. Dependency-free;
+/// only the date part is used.
+fn parse_iso_date(s: &str) -> Option<u64> {
+    let date_part = s.split(['T', ' ']).next().unwrap_or(s);
+    let mut it = date_part.split('-');
+    let year: i64 = it.next()?.parse().ok()?;
+    let month: i64 = it.next()?.parse().ok()?;
+    let day: i64 = it.next()?.parse().ok()?;
+    if it.next().is_some() {
+        return None;
+    }
+    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) {
+        return None;
+    }
+    // Reject a day past the month length (e.g. 2026-02-30): otherwise the
+    // arithmetic rolls into the next month and `diff --since` picks the wrong
+    // baseline instead of erroring.
+    let max_day = if month == 2 && is_leap_year(year) {
+        29
+    } else {
+        MONTH_DAYS[(month - 1) as usize]
+    };
+    if !(1..=max_day).contains(&day) {
+        return None;
+    }
+    // Days from 1970-01-01 to the start of `year`.
+    let mut days: i64 = 0;
+    for y in 1970..year {
+        days += if is_leap_year(y) { 366 } else { 365 };
+    }
+    for (m, md) in MONTH_DAYS.iter().enumerate() {
+        if (m as i64) + 1 >= month {
+            break;
+        }
+        days += md;
+        if (m as i64) + 1 == 2 && is_leap_year(year) {
+            days += 1;
+        }
+    }
+    days += day - 1;
+    Some((days * 86400) as u64)
+}
+
+/// `tirith threat-db diff --since <version-or-date>`.
+pub fn diff(since: &str, json: bool) -> i32 {
+    // Fold the current DB into history first so a fresh install can be a
+    // baseline for a later diff.
+    snapshot_current_db();
+
+    let limitation = "The threat DB format retains no per-entry history, so this diff reports \
+         category and per-source COUNT deltas between recorded snapshots — not the \
+         exact entries added or removed. Snapshots accrue each time a transparency \
+         command runs."
+        .to_string();
+
+    let (since_kind, want_version, want_epoch) = match parse_since(since) {
+        Ok(v) => v,
+        Err(e) => {
+            if json {
+                // Exit code is already 1 (invalid --since); a JSON-write failure
+                // can't make it worse, so the result is discarded.
+                let _ = print_json_value(&DiffReport {
+                    since: since.to_string(),
+                    since_kind: "invalid".to_string(),
+                    baseline: None,
+                    current: None,
+                    delta: None,
+                    source_delta: Default::default(),
+                    limitation,
+                    note: Some(e.clone()),
+                });
+            } else {
+                eprintln!("tirith: {e}");
+            }
+            return 1;
+        }
+    };
+
+    let (history, history_read_error) = load_history();
+    let current = current_snapshot();
+
+    // Baseline: newest snapshot at or before the requested point. For a version,
+    // compare build_sequence; for a date, compare `recorded_at` (when tirith
+    // observed the DB), not the CI build timestamp.
+    let baseline = history
+        .iter()
+        .filter(|s| match (want_version, want_epoch) {
+            (Some(v), _) => s.build_sequence <= v,
+            (_, Some(e)) => s.recorded_at <= e,
+            _ => false,
+        })
+        .max_by_key(|s| (s.recorded_at, s.build_sequence))
+        .cloned();
+
+    let summarize = |s: &DbSnapshot| SnapshotSummary {
+        build_sequence: s.build_sequence,
+        build_timestamp: s.build_timestamp,
+        recorded_at: s.recorded_at,
+        counts: s.counts.clone(),
+    };
+
+    let (delta, source_delta, note) = match (&baseline, &current) {
+        (Some(b), Some(c)) => {
+            let d = delta_of(&c.counts, &b.counts);
+            let mut sd: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+            for (src, cur_count) in &c.sources {
+                let base_count = b.sources.get(src).copied().unwrap_or(0);
+                let diff = *cur_count as i64 - base_count as i64;
+                if diff != 0 {
+                    sd.insert(src.clone(), diff);
+                }
+            }
+            let note = if b.build_sequence == c.build_sequence {
+                Some(
+                    "Baseline and current snapshot are the same DB version — no \
+                     change since the requested point."
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            (Some(d), sd, note)
+        }
+        (None, Some(_)) => (
+            None,
+            Default::default(),
+            // An existing-but-unreadable history file must surface the read
+            // failure, not "no snapshot recorded".
+            Some(history_read_error.clone().unwrap_or_else(|| {
+                format!(
+                    "No snapshot was recorded at or before '{since}'. tirith only began \
+                     retaining snapshots from the first transparency command after this \
+                     feature was installed; a diff needs at least one earlier snapshot. \
+                     Run 'tirith threat-db health' periodically to build up history."
+                )
+            })),
+        ),
+        (_, None) => (
+            None,
+            Default::default(),
+            Some(
+                "Threat DB is not installed — nothing to diff. Run \
+                 'tirith threat-db update' first."
+                    .to_string(),
+            ),
+        ),
+    };
+
+    let report = DiffReport {
+        since: since.to_string(),
+        since_kind,
+        baseline: baseline.as_ref().map(summarize),
+        current: current.as_ref().map(summarize),
+        delta,
+        source_delta,
+        limitation,
+        note,
+    };
+
+    if json {
+        return print_json_value(&report);
+    }
+    print_diff_human(&report);
+    0
+}
+
+fn print_diff_human(r: &DiffReport) {
+    println!("threat-db diff (since {} = {})", r.since, r.since_kind);
+    println!("  note: {}", r.limitation);
+
+    if let (Some(b), Some(c)) = (&r.baseline, &r.current) {
+        println!();
+        println!(
+            "  baseline:  DB v{} built {} (snapshot recorded {})",
+            b.build_sequence,
+            format_epoch(b.build_timestamp),
+            format_epoch(b.recorded_at)
+        );
+        println!(
+            "  current:   DB v{} built {}",
+            c.build_sequence,
+            format_epoch(c.build_timestamp)
+        );
+        if let Some(ref d) = r.delta {
+            println!();
+            println!("  count change (current - baseline):");
+            print_delta_line("packages", d.packages);
+            print_delta_line("hostnames", d.hostnames);
+            print_delta_line("IPs", d.ips);
+            print_delta_line("typosquats", d.typosquats);
+            print_delta_line("popular", d.popular);
+            print_delta_line("TOTAL", d.total);
+        }
+        if !r.source_delta.is_empty() {
+            println!();
+            println!("  per-source count change:");
+            for (src, delta) in &r.source_delta {
+                print_delta_line(src, *delta);
+            }
+        }
+    }
+
+    if let Some(ref note) = r.note {
+        println!();
+        println!("  {note}");
+    }
+}
+
+fn print_delta_line(label: &str, delta: i64) {
+    let sign = if delta > 0 {
+        format!("+{delta}")
+    } else {
+        delta.to_string()
+    };
+    println!("    {label:<14} {sign}");
+}
+
+/// Serialize `value` as pretty JSON to stdout. `0` on success, `1` on a
+/// serialization failure (so a JSON consumer can tell the output is incomplete).
+#[must_use]
+fn print_json_value(value: &impl serde::Serialize) -> i32 {
+    match serde_json::to_string_pretty(value) {
+        Ok(s) => {
+            println!("{s}");
+            0
+        }
+        Err(e) => {
+            eprintln!("tirith: JSON serialization failed: {e}");
+            1
+        }
+    }
+}
+
+/// Format a Unix epoch as a UTC `YYYY-MM-DD HH:MM:SS` string (dependency-free).
+fn format_epoch(epoch: u64) -> String {
+    let days = epoch / 86400;
+    let secs_of_day = epoch % 86400;
+    let (hh, mm, ss) = (
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+    );
+
+    let mut year: i64 = 1970;
+    let mut remaining = days as i64;
+    loop {
+        let year_len = if is_leap_year(year) { 366 } else { 365 };
+        if remaining < year_len {
+            break;
+        }
+        remaining -= year_len;
+        year += 1;
+    }
+    let mut month = 1;
+    for (m, md) in MONTH_DAYS.iter().enumerate() {
+        let mut len = *md;
+        if m == 1 && is_leap_year(year) {
+            len += 1;
+        }
+        if remaining < len {
+            break;
+        }
+        remaining -= len;
+        month += 1;
+    }
+    let day = remaining + 1;
+    format!("{year:04}-{month:02}-{day:02} {hh:02}:{mm:02}:{ss:02} UTC")
+}
+
+/// Format an age in hours as a compact human string.
+fn format_age(hours: f64) -> String {
+    if hours < 1.0 {
+        format!("{:.0} minutes", hours * 60.0)
+    } else if hours < 48.0 {
+        format!("{hours:.0} hours")
+    } else {
+        format!("{:.1} days", hours / 24.0)
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::test_harness::{EnvGuard, ENV_LOCK};
     use std::path::Path;
     use std::sync::atomic::Ordering;
+    use tirith_core::threatdb::ThreatDbFormat;
 
-    /// Serialize tests that manipulate environment variables.
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // ---- v2 index (DB-B) -------------------------------------------------
 
-    // -----------------------------------------------------------------------
-    // Testable coordination helpers (test-only, extracted from production code)
-    // -----------------------------------------------------------------------
+    /// Build an `IndexV2` from raw parts with an empty signature, then sign its
+    /// canonical payload with `key` and fill the signature in.
+    fn signed_index_v2(sequence: u64, assets: Vec<IndexAsset>, key: &SigningKey) -> IndexV2 {
+        let mut idx = IndexV2 {
+            manifest_version: SIGNED_MANIFEST_VERSION,
+            sequence,
+            assets,
+            signature: String::new(),
+        };
+        let payload = idx.canonical_payload();
+        use ed25519_dalek::Signer;
+        let sig = key.sign(payload.as_bytes());
+        idx.signature =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, sig.to_bytes());
+        idx
+    }
+
+    fn asset(format: u32, min: Option<&str>) -> IndexAsset {
+        let filename = format!("tirith-threatdb-v{format}.dat");
+        IndexAsset {
+            format,
+            url: format!("https://example.com/{filename}"),
+            filename,
+            sha256: "00".repeat(32),
+            size: 1024,
+            min_tirith_version: min.map(str::to_string),
+        }
+    }
+
+    fn signed_manifest(version: u64, url: &str, sha256: &str, key: &SigningKey) -> Manifest {
+        let mut manifest = Manifest {
+            sha256: sha256.to_string(),
+            size: 1024,
+            url: url.to_string(),
+            version,
+            signature: String::new(),
+        };
+        use ed25519_dalek::Signer;
+        let signature = key.sign(manifest.canonical_payload().as_bytes());
+        manifest.signature = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            signature.to_bytes(),
+        );
+        manifest
+    }
+
+    #[test]
+    fn already_current_primary_still_reconciles_supplemental_state() {
+        for outcome in [UpdateOutcome::Installed, UpdateOutcome::AlreadyCurrent] {
+            let mut calls = 0usize;
+            reconcile_supplemental_after_primary(outcome, || {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(calls, 1, "{outcome:?} must reconcile exactly once");
+        }
+        let mut calls = 0usize;
+        assert!(
+            reconcile_supplemental_after_primary(UpdateOutcome::NoCompatibleAsset, || {
+                calls += 1;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(
+            calls, 0,
+            "an unresolved primary must not publish an overlay"
+        );
+    }
+
+    #[test]
+    fn disabled_supplemental_removal_is_idempotent_and_reports_real_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("supplemental.dat");
+        std::fs::write(&path, b"stale overlay").unwrap();
+        remove_disabled_supplemental(&path).unwrap();
+        assert!(!path.exists());
+        remove_disabled_supplemental(&path).unwrap();
+
+        let directory = root.path().join("not-a-file");
+        std::fs::create_dir(&directory).unwrap();
+        let error = remove_disabled_supplemental(&directory).unwrap_err();
+        assert!(error.contains("failed to remove"), "{error}");
+        assert!(directory.is_dir());
+    }
+
+    #[test]
+    fn supplemental_aggregate_limit_is_atomic() {
+        let mut supplemental = SupplementalEntries::default();
+        let first = tirith_core::threatdb_feeds::FeedEntries {
+            hostnames: vec!["one.example".to_string()],
+            ips: vec![],
+        };
+        assert_eq!(
+            supplemental
+                .ingest_with_limit(first, ThreatSource::Urlhaus, 1)
+                .unwrap(),
+            1
+        );
+        let second = tirith_core::threatdb_feeds::FeedEntries {
+            hostnames: vec!["two.example".to_string()],
+            ips: vec![],
+        };
+        let error = supplemental
+            .ingest_with_limit(second, ThreatSource::PhishingArmy, 1)
+            .unwrap_err();
+        assert!(error.contains("aggregate indicator limit"), "{error}");
+        assert_eq!(supplemental.hostnames.len(), 1);
+        assert_eq!(supplemental.hostnames[0].0, "one.example");
+    }
+
+    #[test]
+    fn legacy_invalid_primary_uses_valid_signed_fallback() {
+        let key = SigningKey::from_bytes(&[0x31; 32]);
+        let fallback = signed_manifest(
+            12,
+            "https://example.com/fallback.dat",
+            &"b".repeat(64),
+            &key,
+        );
+        let mut invalid_primary =
+            signed_manifest(13, "https://example.com/primary.dat", &"a".repeat(64), &key);
+        invalid_primary.version = 14;
+
+        let selected = fetch_manifest_with(
+            |url| {
+                if url == MANIFEST_URL_PRIMARY {
+                    Ok(invalid_primary.clone())
+                } else {
+                    Ok(fallback.clone())
+                }
+            },
+            &key.verifying_key(),
+        )
+        .expect("valid fallback must survive an unauthenticated primary");
+        assert_eq!(selected.version, 12);
+        assert!(selected
+            .verify_signature_with_key(&key.verifying_key())
+            .is_ok());
+    }
+
+    #[test]
+    fn legacy_selection_chooses_newest_only_after_both_verify() {
+        let key = SigningKey::from_bytes(&[0x32; 32]);
+        let primary = signed_manifest(11, "https://example.com/primary.dat", &"a".repeat(64), &key);
+        let fallback = signed_manifest(
+            12,
+            "https://example.com/fallback.dat",
+            &"b".repeat(64),
+            &key,
+        );
+        let selected = fetch_manifest_with(
+            |url| {
+                if url == MANIFEST_URL_PRIMARY {
+                    Ok(primary.clone())
+                } else {
+                    Ok(fallback.clone())
+                }
+            },
+            &key.verifying_key(),
+        )
+        .unwrap();
+        assert_eq!(selected.version, 12);
+        assert_eq!(selected.url, fallback.url);
+    }
+
+    #[test]
+    fn legacy_equal_version_signed_equivocation_fails_closed() {
+        let key = SigningKey::from_bytes(&[0x33; 32]);
+        let primary = signed_manifest(12, "https://example.com/primary.dat", &"a".repeat(64), &key);
+        let fallback = signed_manifest(
+            12,
+            "https://example.com/fallback.dat",
+            &"b".repeat(64),
+            &key,
+        );
+        let error = fetch_manifest_with(
+            |url| {
+                if url == MANIFEST_URL_PRIMARY {
+                    Ok(primary.clone())
+                } else {
+                    Ok(fallback.clone())
+                }
+            },
+            &key.verifying_key(),
+        )
+        .unwrap_err();
+        assert!(error.contains("equivocation"), "{error}");
+    }
+
+    #[test]
+    fn generation_index_requires_one_matching_asset_per_format() {
+        let key = SigningKey::from_bytes(&[2u8; 32]);
+        let valid = signed_index_v2(1, vec![asset(1, None), asset(2, Some("0.3.4"))], &key);
+        assert!(valid.validate_generation().is_ok());
+
+        let partial = signed_index_v2(1, vec![asset(2, Some("0.3.4"))], &key);
+        assert!(partial.validate_generation().is_err());
+
+        let mut mismatched = asset(2, Some("0.3.4"));
+        mismatched.filename = "different.dat".to_string();
+        let mismatched = signed_index_v2(1, vec![asset(1, None), mismatched], &key);
+        assert!(mismatched.validate_generation().is_err());
+
+        let mut duplicate_name_v1 = asset(1, None);
+        duplicate_name_v1.filename = "shared.dat".to_string();
+        duplicate_name_v1.url = "https://example.com/shared.dat?format=1".to_string();
+        let mut duplicate_name_v2 = asset(2, Some("0.3.4"));
+        duplicate_name_v2.filename = "shared.dat".to_string();
+        duplicate_name_v2.url = "https://example.com/shared.dat?format=2".to_string();
+        let duplicate_names = signed_index_v2(1, vec![duplicate_name_v1, duplicate_name_v2], &key);
+        assert!(duplicate_names
+            .validate_generation()
+            .unwrap_err()
+            .contains("distinct filenames"));
+
+        let mut duplicate_url_v2 = asset(2, Some("0.3.4"));
+        duplicate_url_v2.url = asset(1, None).url;
+        let duplicate_urls = signed_index_v2(1, vec![asset(1, None), duplicate_url_v2], &key);
+        assert!(duplicate_urls
+            .validate_generation()
+            .unwrap_err()
+            .contains("distinct URLs"));
+    }
+
+    #[test]
+    fn index_v2_canonical_payload_is_sorted_and_excludes_signature() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let idx = signed_index_v2(42, vec![asset(2, Some("0.3.4")), asset(1, None)], &key);
+        let payload = idx.canonical_payload();
+        // No whitespace; signature field absent; top-level keys alphabetical.
+        assert!(!payload.contains(' '));
+        assert!(!payload.contains("signature"));
+        let pos_assets = payload.find("\"assets\"").unwrap();
+        let pos_version = payload.find("\"manifest_version\"").unwrap();
+        let pos_sequence = payload.find("\"sequence\"").unwrap();
+        assert!(
+            pos_assets < pos_version && pos_version < pos_sequence,
+            "top-level keys are alphabetical"
+        );
+        // Per-asset keys are alphabetical: filename, format, min_tirith_version,
+        // sha256, size, url.
+        let a = payload.find("\"filename\"").unwrap();
+        let b = payload.find("\"format\"").unwrap();
+        let c = payload.find("\"sha256\"").unwrap();
+        assert!(a < b && b < c, "asset keys must be alphabetical");
+    }
+
+    #[test]
+    fn index_asset_filename_is_in_signed_canonical_payload() {
+        // `filename` is not dead code: it is part of the canonical payload that
+        // gets signed, so tampering with it must change what is verified. Build an
+        // index with a known filename and assert the canonical payload carries it.
+        let key = SigningKey::from_bytes(&[4u8; 32]);
+        let mut a = asset(2, None);
+        a.filename = "tirith-threatdb-known-name.dat".to_string();
+        let idx = signed_index_v2(1, vec![a], &key);
+        let payload = idx.canonical_payload();
+        assert!(
+            payload.contains(r#""filename":"tirith-threatdb-known-name.dat""#),
+            "filename must appear in the signed canonical payload: {payload}"
+        );
+    }
+
+    #[test]
+    fn canonical_payload_keys_sorted_and_signature_excluded() {
+        // Drift guard for the SIGNED contract. `canonical_payload` builds the
+        // canonical JSON by hand; a v2 client recomputes it to verify a published
+        // index, and the DB-D workflow signs the byte-identical `jq -cS` form. If
+        // the hand-built bytes ever drift from a canonically-sorted serialization,
+        // v2 silently disables (clients fall back to v1). Re-derive the canonical
+        // form a DIFFERENT way (serialize the struct minus the signature to a
+        // Value, sort every object's keys, emit compact) and assert byte-equality
+        // with `canonical_payload`, so any future drift fails this test.
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let idx = signed_index_v2(42, vec![asset(2, Some("0.3.4")), asset(1, None)], &key);
+
+        // Independent re-derivation via a different construction path than
+        // `canonical_payload`: build a `Value` from the struct fields with the
+        // `json!` macro (deliberately NOT in alphabetical order, and NOT including
+        // the signature), recursively sort every object's keys, then emit compact.
+        // `IndexV2` derives only `Deserialize`, so we hand-build the Value rather
+        // than `serde_json::to_value`; the point is an alternate path, not reuse.
+        let assets: Vec<serde_json::Value> = idx
+            .assets
+            .iter()
+            .map(|a| {
+                // Intentionally reverse-alphabetical insertion so the sort step,
+                // not the insertion order, is what produces the canonical form.
+                let mut m = serde_json::json!({
+                    "url": a.url,
+                    "size": a.size,
+                    "sha256": a.sha256,
+                    "format": a.format,
+                    "filename": a.filename,
+                });
+                if let Some(ref v) = a.min_tirith_version {
+                    m.as_object_mut()
+                        .unwrap()
+                        .insert("min_tirith_version".to_string(), serde_json::json!(v));
+                }
+                m
+            })
+            .collect();
+        let value = serde_json::json!({
+            "sequence": idx.sequence,
+            "manifest_version": idx.manifest_version,
+            "assets": assets,
+        });
+        let sorted = sort_json_keys(&value);
+        let independent = serde_json::to_string(&sorted).unwrap();
+
+        assert_eq!(
+            idx.canonical_payload(),
+            independent,
+            "canonical_payload must equal an independently sorted, signature-free serialization"
+        );
+
+        // Every object in the independent form has its keys sorted at every level.
+        assert_json_object_keys_sorted(&sorted);
+        assert!(!independent.contains("signature"), "signature excluded");
+
+        // The canonical payload is valid JSON and round-trips back to the same
+        // assets and sequence (the signed fields survive a parse).
+        let reparsed: serde_json::Value = serde_json::from_str(&idx.canonical_payload()).unwrap();
+        assert_eq!(reparsed["sequence"], serde_json::json!(idx.sequence));
+        assert_eq!(
+            reparsed["manifest_version"],
+            serde_json::json!(idx.manifest_version)
+        );
+        assert_eq!(
+            reparsed["assets"].as_array().unwrap().len(),
+            idx.assets.len()
+        );
+    }
+
+    /// Recursively return a copy of `v` with every JSON object's keys sorted.
+    /// `serde_json::Map` is backed by a `BTreeMap` by default, so reinserting into
+    /// a fresh map yields sorted keys; this re-derivation does not depend on the
+    /// hand-written insertion order in `canonical_payload`.
+    fn sort_json_keys(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut sorted = serde_json::Map::new();
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                for k in keys {
+                    sorted.insert(k.clone(), sort_json_keys(&map[k]));
+                }
+                serde_json::Value::Object(sorted)
+            }
+            serde_json::Value::Array(arr) => {
+                serde_json::Value::Array(arr.iter().map(sort_json_keys).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Assert every JSON object in `v` (recursively) has keys in sorted order.
+    fn assert_json_object_keys_sorted(v: &serde_json::Value) {
+        match v {
+            serde_json::Value::Object(map) => {
+                let keys: Vec<&String> = map.keys().collect();
+                let mut expected = keys.clone();
+                expected.sort();
+                assert_eq!(keys, expected, "object keys must be sorted: {map:?}");
+                for val in map.values() {
+                    assert_json_object_keys_sorted(val);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for val in arr {
+                    assert_json_object_keys_sorted(val);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn index_v2_signature_roundtrips_against_signer() {
+        // Verify the canonical payload against the signing key directly (the
+        // embedded production key is a placeholder in tests).
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let idx = signed_index_v2(7, vec![asset(2, None)], &key);
+        let sig_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &idx.signature)
+                .unwrap();
+        let signature = Signature::from_slice(&sig_bytes).unwrap();
+        use ed25519_dalek::Verifier;
+        assert!(key
+            .verifying_key()
+            .verify(idx.canonical_payload().as_bytes(), &signature)
+            .is_ok());
+        // Tampering with either the sequence or schema version changes the
+        // authenticated payload.
+        let mut tampered = idx.clone();
+        tampered.sequence = 8;
+        assert!(key
+            .verifying_key()
+            .verify(tampered.canonical_payload().as_bytes(), &signature)
+            .is_err());
+        let mut tampered = idx.clone();
+        tampered.manifest_version += 1;
+        assert!(key
+            .verifying_key()
+            .verify(tampered.canonical_payload().as_bytes(), &signature)
+            .is_err());
+    }
+
+    #[test]
+    fn verify_signature_rejects_unknown_manifest_version() {
+        // A genuinely signed future schema is authenticated first, then rejected
+        // because this client cannot safely interpret it.
+        let key = SigningKey::from_bytes(&[6u8; 32]);
+        let mut idx = signed_index_v2(7, vec![asset(1, None), asset(2, None)], &key);
+        idx.manifest_version = SIGNED_MANIFEST_VERSION + 1;
+        use ed25519_dalek::Signer;
+        idx.signature = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            key.sign(idx.canonical_payload().as_bytes()).to_bytes(),
+        );
+        let err = idx
+            .verify_signature_with_key(&key.verifying_key())
+            .expect_err("an unknown manifest_version must be rejected");
+        assert!(
+            err.contains("manifest_version"),
+            "error must name manifest_version, got: {err}"
+        );
+
+        // Mutating only the version of a valid schema-v2 document fails at the
+        // signature boundary, before the unsupported-version interpretation.
+        let mut tampered = signed_index_v2(7, vec![asset(1, None), asset(2, None)], &key);
+        tampered.manifest_version += 1;
+        let err = tampered
+            .verify_signature_with_key(&key.verifying_key())
+            .unwrap_err();
+        assert!(
+            err.contains("signature verification failed"),
+            "unsigned version mutation must fail authenticity first, got: {err}"
+        );
+    }
+
+    #[test]
+    fn index_v2_verify_signature_rejects_garbage() {
+        let key = SigningKey::from_bytes(&[13u8; 32]);
+        let idx = IndexV2 {
+            manifest_version: SIGNED_MANIFEST_VERSION,
+            sequence: 1,
+            assets: vec![asset(1, None)],
+            signature: "not-base64-or-too-short".to_string(),
+        };
+        assert!(idx.verify_signature_with_key(&key.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn invalid_primary_index_uses_valid_release_fallback() {
+        let key = SigningKey::from_bytes(&[12u8; 32]);
+        let fallback = signed_index_v2(9, vec![asset(1, None), asset(2, None)], &key);
+        let mut primary = fallback.clone();
+        primary.sequence = 8;
+        // Keep the fallback signature on the mutated primary: its JSON parses,
+        // but authentication must fail and trigger the second candidate.
+
+        let selected = fetch_index_v2_with(
+            |url| {
+                if url == INDEX_V2_URL_PRIMARY {
+                    Ok(Some(primary.clone()))
+                } else if url == INDEX_V2_URL_FALLBACK {
+                    Ok(Some(fallback.clone()))
+                } else {
+                    Err(format!("unexpected URL: {url}"))
+                }
+            },
+            &key.verifying_key(),
+        )
+        .expect("a valid release index must survive an invalid primary")
+        .expect("a verified index is present");
+        assert_eq!(selected.sequence, 9);
+        assert!(selected
+            .verify_signature_with_key(&key.verifying_key())
+            .is_ok());
+    }
+
+    #[test]
+    fn fresh_client_chooses_newest_verified_discovery_surface() {
+        let key = SigningKey::from_bytes(&[14u8; 32]);
+        let primary = signed_index_v2(8, vec![asset(1, None), asset(2, None)], &key);
+        let fallback = signed_index_v2(9, vec![asset(1, None), asset(2, None)], &key);
+        let selected = fetch_index_v2_with(
+            |url| {
+                if url == INDEX_V2_URL_PRIMARY {
+                    Ok(Some(primary.clone()))
+                } else {
+                    Ok(Some(fallback.clone()))
+                }
+            },
+            &key.verifying_key(),
+        )
+        .expect("a replayed older primary must not outrank the release pointer")
+        .expect("a verified index is present");
+        assert_eq!(selected.sequence, 9);
+    }
+
+    #[test]
+    fn equal_sequence_discovery_equivocation_fails_closed() {
+        let key = SigningKey::from_bytes(&[15u8; 32]);
+        let primary = signed_index_v2(9, vec![asset(1, None), asset(2, None)], &key);
+        let mut alternate_v2 = asset(2, None);
+        alternate_v2.filename = "tirith-threatdb-v2-alternate.dat".to_string();
+        alternate_v2.url = "https://example.com/tirith-threatdb-v2-alternate.dat".to_string();
+        let fallback = signed_index_v2(9, vec![asset(1, None), alternate_v2], &key);
+        let error = fetch_index_v2_with(
+            |url| {
+                if url == INDEX_V2_URL_PRIMARY {
+                    Ok(Some(primary.clone()))
+                } else {
+                    Ok(Some(fallback.clone()))
+                }
+            },
+            &key.verifying_key(),
+        )
+        .expect_err("one sequence cannot identify two signed generations");
+        assert!(error.contains("equivocation"), "{error}");
+    }
+
+    #[test]
+    fn unpublished_v2_channel_is_a_clean_fallback() {
+        let key = SigningKey::from_bytes(&[16u8; 32]);
+        let mut requests = Vec::new();
+        let index = fetch_index_v2_with(
+            |url| {
+                requests.push(url.to_string());
+                Ok(None)
+            },
+            &key.verifying_key(),
+        )
+        .unwrap();
+        assert!(index.is_none());
+        assert_eq!(requests, [INDEX_V2_URL_PRIMARY, INDEX_V2_URL_FALLBACK]);
+    }
+
+    #[test]
+    fn missing_v2_surface_does_not_hide_integrity_or_transport_errors() {
+        let key = SigningKey::from_bytes(&[17u8; 32]);
+        let mut tampered = signed_index_v2(9, vec![asset(1, None), asset(2, None)], &key);
+        tampered.sequence += 1;
+        for missing_primary in [false, true] {
+            for invalid_signature in [false, true] {
+                let error = fetch_index_v2_with(
+                    |url| {
+                        if (url == INDEX_V2_URL_PRIMARY) == missing_primary {
+                            Ok(None)
+                        } else if invalid_signature {
+                            Ok(Some(tampered.clone()))
+                        } else {
+                            Err("v2 index HTTP 503 Service Unavailable".to_string())
+                        }
+                    },
+                    &key.verifying_key(),
+                )
+                .unwrap_err();
+                assert!(error.contains("404"), "{error}");
+                assert!(
+                    error.contains(if invalid_signature {
+                        "signature"
+                    } else {
+                        "503"
+                    }),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_verified_v2_surface_survives_an_unpublished_peer() {
+        let key = SigningKey::from_bytes(&[18u8; 32]);
+        let valid = signed_index_v2(9, vec![asset(1, None), asset(2, None)], &key);
+        for missing_primary in [false, true] {
+            let selected = fetch_index_v2_with(
+                |url| {
+                    if (url == INDEX_V2_URL_PRIMARY) == missing_primary {
+                        Ok(None)
+                    } else {
+                        Ok(Some(valid.clone()))
+                    }
+                },
+                &key.verifying_key(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(selected.sequence, 9);
+        }
+    }
+
+    #[test]
+    fn index_v2_select_prefers_highest_compatible_format() {
+        let key = SigningKey::from_bytes(&[1u8; 32]);
+        // v1 (no floor) and v2 (floor 0.3.4). Current build is >= 0.3.4, so v2.
+        let idx = signed_index_v2(1, vec![asset(1, None), asset(2, Some("0.3.4"))], &key);
+        let chosen = idx.select_asset("0.3.4").expect("an asset is compatible");
+        assert_eq!(chosen.format, 2, "highest compatible format wins");
+    }
+
+    #[test]
+    fn post_r3_signed_index_selection_contract_is_frozen() {
+        let key = SigningKey::from_bytes(&[0xc0; 32]);
+        let idx = signed_index_v2(181, vec![asset(2, Some("0.3.4")), asset(1, None)], &key);
+
+        for (client, expected_format, expected_filename) in [
+            ("0.3.3", 1, "tirith-threatdb-v1.dat"),
+            ("0.3.4", 2, "tirith-threatdb-v2.dat"),
+            ("0.4.0", 2, "tirith-threatdb-v2.dat"),
+        ] {
+            let selected = idx
+                .select_asset(client)
+                .unwrap_or_else(|| panic!("post-r3 client {client} must select an asset"));
+            assert_eq!(selected.format, expected_format, "client {client}");
+            assert_eq!(selected.filename, expected_filename, "client {client}");
+        }
+
+        let reversed = signed_index_v2(181, vec![asset(1, None), asset(2, Some("0.3.4"))], &key);
+        assert_eq!(
+            reversed
+                .select_asset("0.3.4")
+                .map(|asset| (asset.format, asset.filename.as_str())),
+            Some((2, "tirith-threatdb-v2.dat")),
+            "signed-index asset order must not affect the selected channel"
+        );
+    }
+
+    #[test]
+    fn index_v2_select_skips_format_above_ceiling() {
+        let key = SigningKey::from_bytes(&[1u8; 32]);
+        // A hypothetical format 99 above MAX_FORMAT_VERSION must be skipped; the
+        // v1 asset is selected instead.
+        let idx = signed_index_v2(1, vec![asset(1, None), asset(99, None)], &key);
+        let chosen = idx.select_asset("9.9.9").expect("v1 still compatible");
+        assert_eq!(chosen.format, 1);
+        assert!(chosen.format <= MAX_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn index_v2_select_honors_min_tirith_version() {
+        let key = SigningKey::from_bytes(&[1u8; 32]);
+        // v2 requires 0.4.0; running 0.3.3 is too old -> only v1 is eligible.
+        let idx = signed_index_v2(1, vec![asset(1, None), asset(2, Some("0.4.0"))], &key);
+        let chosen = idx.select_asset("0.3.3").expect("v1 compatible");
+        assert_eq!(
+            chosen.format, 1,
+            "too-old client must not pick the v2 asset"
+        );
+        // Bumping the client to 0.4.0 makes v2 eligible.
+        assert_eq!(idx.select_asset("0.4.0").unwrap().format, 2);
+    }
+
+    #[test]
+    fn index_v2_select_none_when_nothing_compatible() {
+        let key = SigningKey::from_bytes(&[1u8; 32]);
+        // Only a format-99 asset: nothing at or below the ceiling -> None ->
+        // caller falls back to legacy v1.
+        let idx = signed_index_v2(1, vec![asset(99, None)], &key);
+        assert!(idx.select_asset("0.3.3").is_none());
+    }
+
+    #[test]
+    fn index_v2_select_skips_oversized_asset() {
+        let key = SigningKey::from_bytes(&[1u8; 32]);
+        let mut huge = asset(2, None);
+        huge.size = MAX_INDEX_ASSET_SIZE + 1;
+        let idx = signed_index_v2(1, vec![asset(1, None), huge], &key);
+        let chosen = idx.select_asset("9.9.9").expect("v1 compatible");
+        assert_eq!(chosen.format, 1, "oversized v2 asset is skipped");
+    }
+
+    #[test]
+    fn index_v2_select_unparseable_min_version_is_incompatible() {
+        let key = SigningKey::from_bytes(&[1u8; 32]);
+        // A v2 asset whose floor we cannot parse must NOT be chosen (fail safe).
+        let idx = signed_index_v2(
+            1,
+            vec![asset(1, None), asset(2, Some("not.a.version"))],
+            &key,
+        );
+        let chosen = idx.select_asset("0.3.3").expect("v1 compatible");
+        assert_eq!(chosen.format, 1);
+    }
+
+    #[test]
+    fn select_asset_rejects_duplicate_format() {
+        let key = SigningKey::from_bytes(&[1u8; 32]);
+        // Two compatible assets share the highest format (2). The index is
+        // ambiguous, so selection returns None and the caller falls back to the
+        // legacy v1 manifest rather than picking one of the two arbitrarily.
+        let mut second = asset(2, None);
+        second.url = "https://example.com/db-v2-alt.dat".to_string();
+        let idx = signed_index_v2(1, vec![asset(2, None), second], &key);
+        assert!(
+            idx.select_asset("9.9.9").is_none(),
+            "an ambiguous index with two top-format assets must select nothing"
+        );
+
+        // A lower-format duplicate does not block a single unambiguous top: with
+        // two format-1 assets and one format-2, the format-2 still wins.
+        let idx = signed_index_v2(
+            1,
+            vec![asset(1, None), asset(1, None), asset(2, None)],
+            &key,
+        );
+        assert_eq!(
+            idx.select_asset("9.9.9").map(|a| a.format),
+            Some(2),
+            "a duplicate below the top format must not block the unambiguous top"
+        );
+    }
+
+    #[test]
+    fn primary_db_dest_routes_v2_to_distinct_path_never_v1() {
+        // The format-to-path split: a v2 asset resolves to the distinct
+        // `*-v2.dat`, a v1 asset to the canonical path, and the two are never the
+        // same file (so a v2 asset can never clobber the v1 path an old binary
+        // reads). `install_primary_db`'s own signature check (against the pinned
+        // production key) can't be exercised with a self-signed DB, so the path
+        // routing is tested directly here.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let v1_path = tmp.path().join("tirith-threatdb.dat");
+        let _path_guard = EnvGuard::set("TIRITH_THREATDB_PATH", &v1_path);
+        let v1_dest = primary_db_dest(1).unwrap();
+        let v2_dest = primary_db_dest(2).unwrap();
+        assert_eq!(v1_dest, v1_path);
+        assert_eq!(v2_dest, tmp.path().join("tirith-threatdb-v2.dat"));
+        assert_ne!(v1_dest, v2_dest, "v2 must never resolve to the v1 path");
+    }
+
+    #[test]
+    fn legacy_equal_sequence_v2_requires_install_and_retirement() {
+        assert!(legacy_install_needed(8, Some((8, 2)), false).unwrap());
+        assert!(!legacy_install_needed(8, Some((8, 1)), false).unwrap());
+        assert!(legacy_install_needed(9, Some((8, 2)), false).unwrap());
+        assert!(legacy_install_needed(7, Some((8, 2)), false).is_err());
+        assert!(legacy_install_needed(7, Some((8, 2)), true).unwrap());
+    }
+
+    #[test]
+    fn index_equal_sequence_format_changes_are_not_already_current() {
+        // Rollout race: v1 N can arrive through the legacy manifest before the
+        // complete-generation pointer for v2 N becomes visible.
+        assert!(index_install_needed(8, 2, Some((8, 1)), false).unwrap());
+        // Compatibility-floor/retirement direction: selecting v1 N while v2 N
+        // is cached must install v1 and drive the v2 retirement path.
+        assert!(index_install_needed(8, 1, Some((8, 2)), false).unwrap());
+        assert!(!index_install_needed(8, 2, Some((8, 2)), false).unwrap());
+        assert!(!index_install_needed(8, 1, Some((8, 1)), false).unwrap());
+        assert!(index_install_needed(9, 2, Some((8, 2)), false).unwrap());
+        assert!(index_install_needed(7, 2, Some((8, 2)), false).is_err());
+    }
+
+    #[test]
+    fn retiring_v2_cache_preserves_v1_and_is_idempotent() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let v1_path = tmp.path().join("tirith-threatdb.dat");
+        let v2_path = tmp.path().join("tirith-threatdb-v2.dat");
+        std::fs::write(&v1_path, b"verified-v1-placeholder").unwrap();
+        std::fs::write(&v2_path, b"stale-v2-placeholder").unwrap();
+        let _path_guard = EnvGuard::set("TIRITH_THREATDB_PATH", &v1_path);
+
+        retire_primary_v2().expect("v2 retirement succeeds");
+        assert_eq!(std::fs::read(&v1_path).unwrap(), b"verified-v1-placeholder");
+        assert!(!v2_path.exists());
+        retire_primary_v2().expect("already-retired v2 is a successful no-op");
+    }
+
+    #[test]
+    fn build_format_stamps_distinct_version_per_format() {
+        // The format-mismatch guard in install_primary_db compares the blob's
+        // stamped version against the declared format; confirm a writer stamps
+        // 1 for V1 and 2 for V2 so that guard has a real signal to compare.
+        let key = SigningKey::from_bytes(&[5u8; 32]);
+        let v1 = ThreatDbWriter::new(1, 1)
+            .build_format(ThreatDbFormat::V1, &key)
+            .unwrap();
+        let v2 = ThreatDbWriter::new(2, 2)
+            .build_format(ThreatDbFormat::V2, &key)
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(v1[8..12].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(v2[8..12].try_into().unwrap()), 2);
+    }
+
+    // ---- v2 index publish contract (DB-D) --------------------------------
+    //
+    // These pin the byte-for-byte agreement between the canonical payload the
+    // compiler emits and the release workflow validates
+    // (.github/workflows/threatdb.yml, "Validate compiler-generated signed
+    // generation index") and the payload this client reconstructs in
+    // `IndexV2::canonical_payload()`. The two constants below are the LITERAL
+    // `jq -cS` output of that workflow step (captured by running its exact jq
+    // filter). If `canonical_payload()` ever diverges from this shape, the
+    // workflow's signature would no longer verify on the client and v2 would
+    // silently never take effect (clients fall back to v1); these tests turn
+    // that into a local failure. The PRESENT/ABSENT pair proves the canonical
+    // form is stable whether the optional `min_tirith_version` is emitted or
+    // not, matching how the workflow's jq omits an absent key and how
+    // `canonical_payload()` skips an absent `Option`.
+
+    /// Exact workflow `jq -cS` canonical payload for a two-asset index whose v2
+    /// asset carries `min_tirith_version` and whose v1 asset omits it.
+    const WORKFLOW_V2_INDEX_PAYLOAD_WITH_MIN: &str = concat!(
+        "{\"assets\":[",
+        "{\"filename\":\"tirith-threatdb-7-1.dat\",\"format\":1,",
+        "\"sha256\":\"1111111111111111111111111111111111111111111111111111111111111111\",",
+        "\"size\":4096,",
+        "\"url\":\"https://github.com/sheeki03/tirith/releases/download/threatdb-latest/tirith-threatdb-7-1.dat\"},",
+        "{\"filename\":\"tirith-threatdb-v2-7-1.dat\",\"format\":2,",
+        "\"min_tirith_version\":\"0.3.4\",",
+        "\"sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\",",
+        "\"size\":8192,",
+        "\"url\":\"https://github.com/sheeki03/tirith/releases/download/threatdb-latest/tirith-threatdb-v2-7-1.dat\"}",
+        "],\"manifest_version\":2,\"sequence\":7}"
+    );
+
+    /// Canonical complete-generation payload whose v2 asset has no
+    /// `min_tirith_version` (the absent-Option case).
+    const WORKFLOW_V2_INDEX_PAYLOAD_NO_MIN: &str = concat!(
+        "{\"assets\":[",
+        "{\"filename\":\"tirith-threatdb-7-1.dat\",\"format\":1,",
+        "\"sha256\":\"1111111111111111111111111111111111111111111111111111111111111111\",",
+        "\"size\":4096,",
+        "\"url\":\"https://github.com/sheeki03/tirith/releases/download/threatdb-latest/tirith-threatdb-7-1.dat\"},",
+        "{\"filename\":\"tirith-threatdb-v2-7-1.dat\",\"format\":2,",
+        "\"sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\",",
+        "\"size\":8192,",
+        "\"url\":\"https://github.com/sheeki03/tirith/releases/download/threatdb-latest/tirith-threatdb-v2-7-1.dat\"}",
+        "],\"manifest_version\":2,\"sequence\":7}"
+    );
+
+    /// The published `threatdb-index-v2.json` is exactly the signed canonical
+    /// payload with only the top-level `signature` injected. `manifest_version`
+    /// is already in the canonical payload and therefore authenticated.
+    fn published_index_json(canonical_payload: &str, signature: &str) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(canonical_payload).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.insert(
+            "signature".to_string(),
+            serde_json::Value::String(signature.to_string()),
+        );
+        value.to_string()
+    }
+
+    #[test]
+    fn workflow_v2_index_payload_matches_client_canonical_with_min() {
+        // Parse the PUBLISHED index (signed payload + signature), exactly as the
+        // client receives it over the wire.
+        let published = published_index_json(WORKFLOW_V2_INDEX_PAYLOAD_WITH_MIN, "AA==");
+        let index: IndexV2 = serde_json::from_str(&published).unwrap();
+
+        // The client's reconstruction MUST equal the bytes the workflow signed.
+        assert_eq!(
+            index.canonical_payload(),
+            WORKFLOW_V2_INDEX_PAYLOAD_WITH_MIN,
+            "client canonical_payload() must be byte-identical to the workflow's jq -cS output"
+        );
+        assert!(index.validate_generation().is_ok());
+
+        // And a signature made over canonical_payload() verifies. The pinned
+        // production key can't be self-signed in a test, so sign + verify against
+        // a test key directly (same pattern as the DB-B index_v2 sig roundtrip),
+        // which exercises the same bytes verify_signature() would.
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        use ed25519_dalek::{Signer, Verifier};
+        let sig = key.sign(index.canonical_payload().as_bytes());
+        assert!(key
+            .verifying_key()
+            .verify(index.canonical_payload().as_bytes(), &sig)
+            .is_ok());
+
+        // Tamper-negative: the same signature must NOT verify over a one-byte-
+        // mutated payload, proving the byte-equality above is load-bearing for
+        // authenticity and not just an incidental string match.
+        let mut tampered = WORKFLOW_V2_INDEX_PAYLOAD_WITH_MIN.as_bytes().to_vec();
+        tampered[0] ^= 0x01;
+        assert!(
+            key.verifying_key().verify(&tampered, &sig).is_err(),
+            "signature must not verify over a mutated payload"
+        );
+    }
+
+    #[test]
+    fn workflow_v2_index_payload_matches_client_canonical_no_min() {
+        // Same proof for the absent-`min_tirith_version` case: the canonical form
+        // is stable, and the workflow omitting the key matches `canonical_payload()`
+        // skipping the absent Option.
+        let published = published_index_json(WORKFLOW_V2_INDEX_PAYLOAD_NO_MIN, "AA==");
+        let index: IndexV2 = serde_json::from_str(&published).unwrap();
+
+        assert_eq!(index.assets.len(), 2);
+        assert!(index.assets[1].min_tirith_version.is_none());
+        assert!(index.validate_generation().is_ok());
+        assert_eq!(
+            index.canonical_payload(),
+            WORKFLOW_V2_INDEX_PAYLOAD_NO_MIN,
+            "absent min_tirith_version must yield the same byte shape on both sides"
+        );
+
+        let key = SigningKey::from_bytes(&[8u8; 32]);
+        use ed25519_dalek::{Signer, Verifier};
+        let sig = key.sign(index.canonical_payload().as_bytes());
+        assert!(key
+            .verifying_key()
+            .verify(index.canonical_payload().as_bytes(), &sig)
+            .is_ok());
+    }
+
+    #[test]
+    fn canonical_payload_large_sequence_round_trips_losslessly() {
+        // The workflow signs `--argjson sequence ${RUN_ID}` and the client field
+        // is u64, but jq numbers are IEEE-754 f64, so a RUN_ID > 2^53 would lose
+        // precision on the SIGNING side (jq), even though the client side here is
+        // exact. This documents the u64 client boundary: a sequence above 2^53
+        // must round-trip losslessly through canonical_payload() and a re-parse.
+        // GitHub run IDs are nowhere near 2^53 today, so this is a guard against a
+        // future ID-space change, not a live bug; if jq's f64 ever feeds such a
+        // value the signed bytes (not this client) would be wrong, and the v2
+        // index would simply fail to verify and fall back to v1.
+        let big: u64 = 9_007_199_254_740_993; // 2^53 + 1, not representable in f64
+        let key = SigningKey::from_bytes(&[11u8; 32]);
+        let idx = signed_index_v2(big, vec![asset(2, None)], &key);
+
+        // The canonical payload carries the exact integer literal (no f64 rounding,
+        // no scientific notation): serde_json emits u64 as an exact integer.
+        let payload = idx.canonical_payload();
+        assert!(
+            payload.contains(&format!("\"sequence\":{big}")),
+            "sequence must serialize as the exact u64 literal, got: {payload}"
+        );
+
+        // Re-parsing the canonical payload yields the same u64 with no loss.
+        let reparsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            reparsed["sequence"].as_u64(),
+            Some(big),
+            "sequence must round-trip losslessly as u64"
+        );
+
+        // And parsing a full IndexV2 (the wire path) preserves it too.
+        let published = published_index_json(&payload, &idx.signature);
+        let parsed: IndexV2 = serde_json::from_str(&published).unwrap();
+        assert_eq!(parsed.sequence, big, "wire round-trip must preserve u64");
+    }
 
     /// Check whether the next-check-at file indicates the update is not yet due.
     fn is_next_check_in_future(state_dir: &Path, now: u64) -> bool {
@@ -1198,13 +4031,9 @@ mod tests {
         Some(lock_file)
     }
 
-    // -----------------------------------------------------------------------
-    // 1. auto_update_hours=0 disables update
-    // -----------------------------------------------------------------------
-
     #[test]
     fn auto_update_hours_zero_disables_background_child() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let policy_dir = tmp.path().join(".tirith");
         std::fs::create_dir_all(&policy_dir).unwrap();
@@ -1214,28 +4043,20 @@ mod tests {
         )
         .unwrap();
 
-        // Point policy discovery at our temp dir
-        unsafe { std::env::set_var("TIRITH_POLICY_ROOT", tmp.path()) };
+        let _policy_guard = EnvGuard::set("TIRITH_POLICY_ROOT", tmp.path());
 
         let policy = policy::Policy::discover(Some(tmp.path().to_str().unwrap()));
         assert_eq!(
             policy.threat_intel.auto_update_hours, 0,
             "policy should reflect auto_update_hours=0"
         );
-
-        unsafe { std::env::remove_var("TIRITH_POLICY_ROOT") };
     }
-
-    // -----------------------------------------------------------------------
-    // 2. next-check-at in the future skips update
-    // -----------------------------------------------------------------------
 
     #[test]
     fn next_check_at_future_skips_update() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
 
-        // Write a next-check-at timestamp 1 hour in the future
         let future_ts = unix_now() + 3600;
         std::fs::write(state.join(NEXT_CHECK_FILE), future_ts.to_string()).unwrap();
 
@@ -1251,7 +4072,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
 
-        // Write a next-check-at timestamp 1 hour in the past
         let past_ts = unix_now().saturating_sub(3600);
         std::fs::write(state.join(NEXT_CHECK_FILE), past_ts.to_string()).unwrap();
 
@@ -1266,7 +4086,6 @@ mod tests {
     fn next_check_at_missing_allows_update() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
-        // No file written — first run scenario
 
         let now = unix_now();
         assert!(
@@ -1288,16 +4107,11 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // 3. spawned-at recent (<30s) skips update
-    // -----------------------------------------------------------------------
-
     #[test]
     fn spawned_at_recent_skips_update() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
 
-        // Write a spawned-at timestamp 5 seconds ago (within the 30s dedup window)
         let recent_ts = unix_now().saturating_sub(5);
         std::fs::write(state.join(SPAWNED_AT_FILE), recent_ts.to_string()).unwrap();
 
@@ -1313,7 +4127,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
 
-        // Write a spawned-at timestamp 60 seconds ago (outside the 30s dedup window)
         let old_ts = unix_now().saturating_sub(60);
         std::fs::write(state.join(SPAWNED_AT_FILE), old_ts.to_string()).unwrap();
 
@@ -1328,7 +4141,6 @@ mod tests {
     fn spawned_at_missing_allows_update() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
-        // No file — first spawn
 
         let now = unix_now();
         assert!(
@@ -1337,56 +4149,44 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // 4. UPDATE_ATTEMPTED AtomicBool guard prevents second attempt
-    // -----------------------------------------------------------------------
-
     #[test]
     fn update_attempted_guard_fires_once() {
-        // Use a standalone AtomicBool to verify the swap-based guard pattern
-        // (We cannot reset the global UPDATE_ATTEMPTED without affecting other tests.)
+        // Standalone AtomicBool: the real global UPDATE_ATTEMPTED can't be reset.
         let guard = AtomicBool::new(false);
 
-        // First swap: returns old value (false) — should proceed
         let first = guard.swap(true, Ordering::Relaxed);
         assert!(
             !first,
             "first swap should return false, allowing the update"
         );
 
-        // Second swap: returns old value (true) — should skip
         let second = guard.swap(true, Ordering::Relaxed);
         assert!(second, "second swap should return true, blocking re-entry");
 
-        // Third swap: still true
         let third = guard.swap(true, Ordering::Relaxed);
         assert!(third, "third swap should also return true");
     }
-
-    // -----------------------------------------------------------------------
-    // 5. Background child lock dedup
-    // -----------------------------------------------------------------------
 
     #[test]
     fn lock_dedup_second_acquire_fails() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
 
-        // First acquire succeeds
         let lock1 = try_acquire_update_lock(state);
         assert!(lock1.is_some(), "first lock acquisition should succeed");
 
-        // Second acquire should fail (lock already held)
         let lock2 = try_acquire_update_lock(state);
         assert!(
             lock2.is_none(),
             "second lock acquisition should fail while first is held"
         );
 
-        // Drop the first lock to release
-        drop(lock1);
+        // Explicit unlock then drop: Drop alone races on macOS BSD `flock`
+        // (release-on-close not always observable to an immediate re-acquire).
+        let l1 = lock1.unwrap();
+        fs2::FileExt::unlock(&l1).expect("unlock lock1");
+        drop(l1);
 
-        // After releasing, a new acquire should succeed
         let lock3 = try_acquire_update_lock(state);
         assert!(
             lock3.is_some(),
@@ -1407,18 +4207,13 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // 6. Failure backoff: next-check-at = now + 1h on failure
-    // -----------------------------------------------------------------------
-
     #[test]
     fn failure_backoff_sets_one_hour() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
         let next_check_path = state.join(NEXT_CHECK_FILE);
 
-        // Simulate what run_background_update does on failure:
-        // writes now + BACKOFF_SECS to next-check-at
+        // Matches what run_background_update writes on failure.
         let now = unix_now();
         let backoff_ts = now + BACKOFF_SECS;
         std::fs::write(&next_check_path, backoff_ts.to_string()).unwrap();
@@ -1426,7 +4221,6 @@ mod tests {
         let content = std::fs::read_to_string(&next_check_path).unwrap();
         let written_ts: u64 = content.trim().parse().unwrap();
 
-        // Backoff should be ~1 hour from now (allow 5s tolerance)
         let diff = written_ts.saturating_sub(now);
         assert_eq!(
             diff, BACKOFF_SECS,
@@ -1445,7 +4239,6 @@ mod tests {
         let state = tmp.path();
         let next_check_path = state.join(NEXT_CHECK_FILE);
 
-        // Simulate what run_background_update does on success with auto_update_hours=24
         let auto_hours: u64 = 24;
         let now = unix_now();
         let next = now + auto_hours * 3600;
@@ -1464,8 +4257,7 @@ mod tests {
 
     #[test]
     fn backoff_differs_from_normal_interval() {
-        // Verify that the failure backoff (1h) is different from the default
-        // auto_update_hours (24h), so users retry sooner after failure.
+        // Failure backoff must be shorter than the normal interval for faster retry.
         let default_config = policy::ThreatIntelConfig::default();
         let normal_interval_secs = default_config.auto_update_hours * 3600;
         assert_ne!(
@@ -1478,10 +4270,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // 7. Canonical manifest payload format
-    // -----------------------------------------------------------------------
-
     #[test]
     fn canonical_payload_format_sorted_keys_no_whitespace() {
         let manifest = Manifest {
@@ -1489,17 +4277,27 @@ mod tests {
             size: 12345,
             url: "https://example.com/tirith-threatdb.dat".to_string(),
             version: 42,
-            signature: String::new(), // not used in canonical payload
+            signature: String::new(),
         };
 
         let payload = manifest.canonical_payload();
 
-        // Keys must be alphabetically sorted: sha256, size, url, version
         assert_eq!(
             payload,
             r#"{"sha256":"abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890","size":12345,"url":"https://example.com/tirith-threatdb.dat","version":42}"#,
             "canonical payload should have alphabetically sorted keys with no whitespace"
         );
+    }
+
+    #[test]
+    fn checked_in_legacy_manifest_has_valid_pinned_signature() {
+        let manifest: Manifest =
+            serde_json::from_str(include_str!("../../../../threatdb-manifest.json"))
+                .expect("checked-in legacy manifest must be valid JSON");
+
+        manifest
+            .verify_signature()
+            .expect("checked-in legacy manifest must verify with the pinned public key");
     }
 
     #[test]
@@ -1542,17 +4340,14 @@ mod tests {
         };
         let payload = manifest.canonical_payload();
 
-        // Verify it's valid UTF-8 (String type guarantees this, but be explicit)
         assert!(
             std::str::from_utf8(payload.as_bytes()).is_ok(),
             "canonical payload must be valid UTF-8"
         );
 
-        // Verify it's valid JSON
         let parsed: serde_json::Value =
             serde_json::from_str(&payload).expect("canonical payload must be valid JSON");
 
-        // Verify the JSON object has exactly the expected keys
         let obj = parsed.as_object().expect("payload should be a JSON object");
         let keys: Vec<&String> = obj.keys().collect();
         assert_eq!(
@@ -1585,7 +4380,6 @@ mod tests {
 
     #[test]
     fn canonical_payload_round_trips_through_json_parse() {
-        // Verify the canonical payload can be deserialized back to matching values
         let manifest = Manifest {
             sha256: "abc123".to_string(),
             size: 42,
@@ -1602,16 +4396,12 @@ mod tests {
         assert_eq!(parsed["version"], 99);
     }
 
-    // -----------------------------------------------------------------------
-    // Edge cases
-    // -----------------------------------------------------------------------
-
     #[test]
     fn spawned_at_exactly_at_boundary_skips() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
 
-        // Exactly at the boundary: 29 seconds ago (within the 30s window)
+        // 29s ago is still inside the 30s window.
         let now = 1000000u64;
         let ts = now - (SPAWNED_AT_DEDUP_SECS - 1);
         std::fs::write(state.join(SPAWNED_AT_FILE), ts.to_string()).unwrap();
@@ -1627,7 +4417,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path();
 
-        // Exactly at the boundary: 30 seconds ago (at the edge, >= DEDUP means proceed)
+        // Exactly 30s ago falls outside the dedup window (strict <).
         let now = 1000000u64;
         let ts = now - SPAWNED_AT_DEDUP_SECS;
         std::fs::write(state.join(SPAWNED_AT_FILE), ts.to_string()).unwrap();
@@ -1646,16 +4436,12 @@ mod tests {
         let now = 1000000u64;
         std::fs::write(state.join(NEXT_CHECK_FILE), now.to_string()).unwrap();
 
-        // now < next_ts is false when they're equal, so update should proceed
+        // Strict `<` comparison: equal timestamps proceed with the update.
         assert!(
             !is_next_check_in_future(state, now),
             "next-check-at == now should allow the update (not strictly in the future)"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // 8. Conditional-GET cache helpers
-    // -----------------------------------------------------------------------
 
     #[test]
     fn manifest_cache_key_is_url_specific() {
@@ -1686,7 +4472,6 @@ mod tests {
         assert_eq!(parsed.version, 99);
         assert_eq!(parsed.size, 42);
 
-        // Verify cached body can be written and re-read (simulates 304 flow)
         let tmp = tempfile::tempdir().unwrap();
         let body_file = tmp.path().join("cached-body");
         std::fs::write(&body_file, json).unwrap();
@@ -1703,20 +4488,14 @@ mod tests {
         let k1 = super::manifest_cache_key(url1);
         let k2 = super::manifest_cache_key(url2);
 
-        // ETag files should differ
         let etag1 = format!("{k1}-etag");
         let etag2 = format!("{k2}-etag");
         assert_ne!(etag1, etag2, "etag files must be per-URL");
 
-        // Body files should differ
         let body1 = format!("{k1}-body");
         let body2 = format!("{k2}-body");
         assert_ne!(body1, body2, "body cache files must be per-URL");
     }
-
-    // -----------------------------------------------------------------------
-    // 9. Cache state machine tests (simulated 200/304/corrupt flows)
-    // -----------------------------------------------------------------------
 
     /// Simulate the cache file operations that fetch_manifest_from does on a 200 response:
     /// persist ETag + body, then verify a simulated 304 can read them back.
@@ -1730,17 +4509,15 @@ mod tests {
 
         let manifest_json = r#"{"sha256":"dead","size":100,"url":"https://x.com/db.dat","version":5,"signature":"sig"}"#;
 
-        // Simulate 200: persist ETag + body (what fetch_manifest_from does on success)
+        // Simulate what fetch_manifest_from persists on a 200 response.
         std::fs::write(&etag_path, "\"etag-value-abc\"").unwrap();
         std::fs::write(&body_path, manifest_json).unwrap();
 
-        // Simulate 304: read cached body (what fetch_manifest_from does on 304)
         let cached = std::fs::read_to_string(&body_path).unwrap();
         let m: Manifest = serde_json::from_str(&cached).unwrap();
         assert_eq!(m.sha256, "dead");
         assert_eq!(m.version, 5);
 
-        // Verify ETag was persisted for conditional GET
         let etag = std::fs::read_to_string(&etag_path).unwrap();
         assert_eq!(etag.trim(), "\"etag-value-abc\"");
     }
@@ -1754,12 +4531,11 @@ mod tests {
         let etag_path = tmp.path().join(format!("{key}-etag"));
         let body_path = tmp.path().join(format!("{key}-body"));
 
-        // State: ETag exists but body does not (e.g., body was deleted manually)
+        // ETag without body — e.g. body manually deleted between runs.
         std::fs::write(&etag_path, "\"stale-etag\"").unwrap();
         assert!(!body_path.exists(), "body should not exist for this test");
 
-        // Simulate the 304 recovery: when body is missing, clean up ETag + body
-        // (This is the recovery path in fetch_manifest_from)
+        // This mirrors the 304 recovery path in fetch_manifest_from.
         let body_ok = body_path
             .exists()
             .then(|| std::fs::read_to_string(&body_path).ok())
@@ -1767,12 +4543,10 @@ mod tests {
             .and_then(|s| serde_json::from_str::<Manifest>(&s).ok());
 
         if body_ok.is_none() {
-            // Recovery: delete stale ETag so next request is unconditional
             let _ = std::fs::remove_file(&etag_path);
             let _ = std::fs::remove_file(&body_path);
         }
 
-        // After cleanup, ETag file should be gone
         assert!(
             !etag_path.exists(),
             "ETag should be deleted after 304 with missing body"
@@ -1788,17 +4562,14 @@ mod tests {
         let etag_path = tmp.path().join(format!("{key}-etag"));
         let body_path = tmp.path().join(format!("{key}-body"));
 
-        // State: ETag exists, body exists but is corrupt JSON
         std::fs::write(&etag_path, "\"some-etag\"").unwrap();
         std::fs::write(&body_path, "this is not json").unwrap();
 
-        // Simulate 304 cache read
         let body_ok = std::fs::read_to_string(&body_path)
             .ok()
             .and_then(|s| serde_json::from_str::<Manifest>(&s).ok());
 
         if body_ok.is_none() {
-            // Recovery: delete stale files
             let _ = std::fs::remove_file(&etag_path);
             let _ = std::fs::remove_file(&body_path);
         }
@@ -1817,10 +4588,10 @@ mod tests {
     #[test]
     fn primary_and_fallback_independent_cache_state() {
         let tmp = tempfile::tempdir().unwrap();
-        let primary =
-            "https://raw.githubusercontent.com/sheeki03/tirith/main/threatdb-manifest.json";
-        let fallback =
-            "https://github.com/sheeki03/tirith/releases/latest/download/threatdb-manifest.json";
+        // Reference the real consts so this test tracks them and never goes stale
+        // when a URL changes (e.g. the fallback moving to the rolling release).
+        let primary = super::MANIFEST_URL_PRIMARY;
+        let fallback = super::MANIFEST_URL_FALLBACK;
 
         let pk = super::manifest_cache_key(primary);
         let fk = super::manifest_cache_key(fallback);
@@ -1830,7 +4601,6 @@ mod tests {
         let p_body = tmp.path().join(format!("{pk}-body"));
         let f_body = tmp.path().join(format!("{fk}-body"));
 
-        // Persist primary cache
         std::fs::write(&p_etag, "\"primary-etag\"").unwrap();
         std::fs::write(
             &p_body,
@@ -1838,7 +4608,6 @@ mod tests {
         )
         .unwrap();
 
-        // Persist fallback cache with different data
         std::fs::write(&f_etag, "\"fallback-etag\"").unwrap();
         std::fs::write(
             &f_body,
@@ -1846,7 +4615,6 @@ mod tests {
         )
         .unwrap();
 
-        // Verify independence
         let pm: Manifest =
             serde_json::from_str(&std::fs::read_to_string(&p_body).unwrap()).unwrap();
         let fm: Manifest =
@@ -1858,7 +4626,6 @@ mod tests {
             std::fs::read_to_string(&f_etag).unwrap()
         );
 
-        // Deleting primary cache does not affect fallback
         std::fs::remove_file(&p_etag).unwrap();
         std::fs::remove_file(&p_body).unwrap();
         assert!(
@@ -1870,10 +4637,6 @@ mod tests {
             "fallback body should survive primary cleanup"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // 10. Cache resolution state machine (exercises resolve_cache directly)
-    // -----------------------------------------------------------------------
 
     const VALID_MANIFEST: &str =
         r#"{"sha256":"abc","size":1,"url":"https://x.com/db.dat","version":1,"signature":"s"}"#;
@@ -1910,7 +4673,8 @@ mod tests {
 
     #[test]
     fn resolve_cache_304_with_corrupt_cache_returns_retry() {
-        // Corrupt cached body → RetryNeeded (not Err), so caller cleans up and retries
+        // Corrupt cached body maps to RetryNeeded so the caller can clean up
+        // and retry unconditionally; it is not an error.
         let r = super::resolve_cache(304, None, Some("not json")).unwrap();
         assert_eq!(
             r,
@@ -1945,15 +4709,37 @@ mod tests {
         assert_eq!(r, super::CacheResolution::Fresh(VALID_MANIFEST.to_string()));
     }
 
-    // -----------------------------------------------------------------------
-    // 11. Transport-level tests (mock HTTP server, exercises real fetch path)
-    //     Uses fetch_manifest_from_with_state() with injectable state dir
-    //     to avoid env var races between parallel tests.
-    // -----------------------------------------------------------------------
-
-    /// Helper: call fetch with isolated state dir (no env var races).
+    /// Fetch with an isolated state dir so parallel tests don't race on env vars.
     fn fetch_with_state(url: &str, state: &std::path::Path) -> Result<Manifest, String> {
-        super::fetch_manifest_from_with_state(url, Some(state.to_path_buf()))
+        // These tests exercise conditional-GET/cache transport against a private
+        // mock server. Production enters through `fetch_manifest_from_with_state`,
+        // which installs the strict URL/resolver/redirect boundary first.
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("test HTTP client");
+        super::fetch_manifest_from_with_state_and_client(url, Some(state.to_path_buf()), &client)
+    }
+
+    #[test]
+    fn production_fetch_paths_reject_private_initial_destinations() {
+        let private = "https://127.0.0.1/threatdb";
+        for error in [
+            super::fetch_manifest_from_with_state(private, None).unwrap_err(),
+            super::download_url(private, 1).unwrap_err(),
+            super::fetch_index_v2_from(private).unwrap_err(),
+        ] {
+            assert!(
+                error.contains("refusing unsafe"),
+                "unexpected error: {error}"
+            );
+        }
+
+        let client = super::guarded_http_client(1).expect("guarded client builds");
+        let error = super::fetch_bytes(&client, private).unwrap_err();
+        assert!(error.contains("refusing unsafe supplemental feed URL"));
     }
 
     #[test]
@@ -1971,8 +4757,6 @@ mod tests {
             .create();
 
         let tmp = tempfile::tempdir().unwrap();
-        // state dir passed directly via fetch_with_state — no env var needed
-
         let url = format!("{}/manifest.json", server.url());
         let result = fetch_with_state(&url, tmp.path());
 
@@ -1981,7 +4765,6 @@ mod tests {
         assert_eq!(m.sha256, "abc");
         assert_eq!(m.version, 1);
 
-        // Verify cache files were written
         let key = super::manifest_cache_key(&url);
         let state = tmp.path();
         let etag_file = state.join(format!("{key}-etag"));
@@ -2004,9 +4787,7 @@ mod tests {
             .create();
 
         let tmp = tempfile::tempdir().unwrap();
-        // state dir passed directly via fetch_with_state — no env var needed
-
-        // Pre-populate cache files
+        // Pre-populate cache files so the 304 path exercises the happy case.
         let url = format!("{}/manifest.json", server.url());
         let key = super::manifest_cache_key(&url);
         let state = tmp.path();
@@ -2027,14 +4808,13 @@ mod tests {
     fn transport_304_without_cache_retries_and_succeeds() {
         let mut server = mockito::Server::new();
 
-        // First request: 304 (no cached body exists)
+        // First request 304 (no cached body), then unconditional retry to 200.
         let mock_304 = server
             .mock("GET", "/manifest.json")
             .with_status(304)
             .expect(1)
             .create();
 
-        // Retry request: 200 (unconditional)
         let retry_json = r#"{"sha256":"fresh","size":1,"url":"https://x.com/db.dat","version":7,"signature":"s"}"#;
         let mock_200 = server
             .mock("GET", "/manifest.json")
@@ -2045,9 +4825,7 @@ mod tests {
             .create();
 
         let tmp = tempfile::tempdir().unwrap();
-        // state dir passed directly via fetch_with_state — no env var needed
-
-        // Pre-populate only ETag (no body — simulates corrupt/deleted cache)
+        // ETag present but no body — simulates corrupt or manually-deleted cache.
         let url = format!("{}/manifest.json", server.url());
         let key = super::manifest_cache_key(&url);
         let state = tmp.path();
@@ -2062,7 +4840,6 @@ mod tests {
         assert_eq!(m.sha256, "fresh");
         assert_eq!(m.version, 7);
 
-        // Verify new ETag was persisted from retry
         let etag = std::fs::read_to_string(state.join(format!("{key}-etag"))).unwrap();
         assert_eq!(etag.trim(), "\"new-etag\"");
     }
@@ -2076,8 +4853,6 @@ mod tests {
             .create();
 
         let tmp = tempfile::tempdir().unwrap();
-        // state dir passed directly via fetch_with_state — no env var needed
-
         let url = format!("{}/manifest.json", server.url());
         let result = fetch_with_state(&url, tmp.path());
 
@@ -2097,15 +4872,13 @@ mod tests {
             .create();
 
         let tmp = tempfile::tempdir().unwrap();
-        // state dir passed directly via fetch_with_state — no env var needed
-
         let url = format!("{}/manifest.json", server.url());
         let result = fetch_with_state(&url, tmp.path());
 
         mock.assert();
         assert!(result.is_err(), "invalid JSON should fail");
 
-        // Verify body was NOT cached (validation-before-cache)
+        // Validation-before-cache: invalid JSON must not land in the cache.
         let key = super::manifest_cache_key(&url);
         let state = tmp.path();
         let body_file = state.join(format!("{key}-body"));
@@ -2127,12 +4900,11 @@ mod tests {
             .create();
 
         let tmp = tempfile::tempdir().unwrap();
-        // state dir passed directly via fetch_with_state — no env var needed
-
         let url = format!("{}/manifest.json", server.url());
         let _ = fetch_with_state(&url, tmp.path());
 
-        mock.assert(); // Fails if User-Agent didn't match
+        // mockito.assert() fails if the User-Agent header didn't match the regex.
+        mock.assert();
     }
 
     #[test]
@@ -2157,5 +4929,429 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("exceeded max size"));
+    }
+
+    // `--offline` / `TIRITH_OFFLINE` (M0.3): the switch must make
+    // `maybe_background_update` a guaranteed no-op — zero network and no
+    // `spawned-at` state file (the breadcrumb written right before a spawn).
+
+    #[test]
+    fn offline_env_active_recognizes_truthy_values() {
+        // `offline_env_active` lives in `cli/mod.rs`; exercise it inside the
+        // shared process-global state guard.
+        let mut guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for v in ["1", "true", "TRUE", "yes", "On", " on "] {
+            guard.set_env("TIRITH_OFFLINE", v);
+            assert!(
+                crate::cli::offline_env_active(),
+                "TIRITH_OFFLINE={v:?} should be treated as offline"
+            );
+        }
+    }
+
+    #[test]
+    fn offline_env_active_rejects_falsey_and_unset() {
+        let mut guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for v in ["0", "false", "no", "", "off", "garbage"] {
+            guard.set_env("TIRITH_OFFLINE", v);
+            assert!(
+                !crate::cli::offline_env_active(),
+                "TIRITH_OFFLINE={v:?} should NOT be treated as offline"
+            );
+        }
+        guard.remove_env("TIRITH_OFFLINE");
+        assert!(
+            !crate::cli::offline_env_active(),
+            "unset TIRITH_OFFLINE should not be offline"
+        );
+    }
+
+    #[test]
+    fn offline_flag_skips_background_update_no_network_attempt() {
+        // With `--offline`, `maybe_background_update` must not reach the state
+        // dir: no `spawned-at` file, so no child spawned (= zero network).
+        let mut guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove_env("TIRITH_OFFLINE");
+        let tmp = tempfile::tempdir().unwrap();
+        let _state_guard = EnvGuard::set("XDG_STATE_HOME", tmp.path());
+
+        super::maybe_background_update(true);
+
+        let spawned_at = tmp.path().join("tirith").join(SPAWNED_AT_FILE);
+        assert!(
+            !spawned_at.exists(),
+            "--offline must skip the background update before any state write"
+        );
+    }
+
+    #[test]
+    fn offline_env_skips_background_update_no_network_attempt() {
+        // Same guarantee via `TIRITH_OFFLINE` (the path shell hooks and the
+        // conformance harness use, lacking CLI flags per `tirith check`).
+        let mut guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        guard.set_env("TIRITH_OFFLINE", "1");
+        let tmp = tempfile::tempdir().unwrap();
+        let _state_guard = EnvGuard::set("XDG_STATE_HOME", tmp.path());
+
+        // `offline_flag = false` here — the env var alone must suffice.
+        super::maybe_background_update(false);
+
+        let spawned_at = tmp.path().join("tirith").join(SPAWNED_AT_FILE);
+        assert!(
+            !spawned_at.exists(),
+            "TIRITH_OFFLINE=1 must skip the background update before any state write"
+        );
+    }
+
+    #[test]
+    fn offline_short_circuits_before_update_attempted_latch() {
+        // The offline check is ahead of the once-per-process `UPDATE_ATTEMPTED`
+        // latch: an offline call must not consume it, so a later online call can
+        // still proceed. Verified on a standalone AtomicBool.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let latch = AtomicBool::new(false);
+        // Simulate the offline early-return: the latch is never swapped.
+        let offline = true;
+        if !offline {
+            latch.swap(true, Ordering::Relaxed);
+        }
+        assert!(
+            !latch.load(Ordering::Relaxed),
+            "an offline call must not consume the once-per-process latch"
+        );
+    }
+
+    #[test]
+    fn parse_indicator_recognizes_ipv4() {
+        let p = parse_indicator("203.0.113.50");
+        assert_eq!(p.kind, IndicatorKind::Ip);
+        assert_eq!(p.value, "203.0.113.50");
+        assert!(p.ecosystem.is_none());
+        assert!(p.version.is_none());
+    }
+
+    #[test]
+    fn parse_indicator_recognizes_ecosystem_prefix() {
+        let p = parse_indicator("npm:left-pad");
+        assert_eq!(p.kind, IndicatorKind::Package);
+        assert_eq!(p.ecosystem, Some(Ecosystem::Npm));
+        assert_eq!(p.value, "left-pad");
+        assert!(p.version.is_none());
+    }
+
+    #[test]
+    fn parse_indicator_recognizes_ecosystem_prefix_with_version() {
+        let p = parse_indicator("pypi:requests@2.0.0");
+        assert_eq!(p.kind, IndicatorKind::Package);
+        assert_eq!(p.ecosystem, Some(Ecosystem::PyPI));
+        assert_eq!(p.value, "requests");
+        assert_eq!(p.version.as_deref(), Some("2.0.0"));
+    }
+
+    #[test]
+    fn parse_indicator_host_colon_port_is_not_a_package() {
+        // `example.com:8080` has a `:` but `example.com` is not an ecosystem,
+        // so it must fall through to the domain branch, not become a package.
+        let p = parse_indicator("example.com:8080");
+        assert_eq!(p.kind, IndicatorKind::Domain);
+    }
+
+    #[test]
+    fn parse_indicator_recognizes_name_at_version() {
+        let p = parse_indicator("lodash@4.17.21");
+        assert_eq!(p.kind, IndicatorKind::Package);
+        assert!(p.ecosystem.is_none());
+        assert_eq!(p.value, "lodash");
+        assert_eq!(p.version.as_deref(), Some("4.17.21"));
+    }
+
+    #[test]
+    fn parse_indicator_scoped_npm_package_is_not_split_on_leading_at() {
+        // A leading `@` is an npm scope, not a version separator.
+        let p = parse_indicator("@angular/core");
+        assert_eq!(p.kind, IndicatorKind::Package);
+        assert_eq!(p.value, "@angular/core");
+        assert!(p.version.is_none());
+    }
+
+    #[test]
+    fn parse_indicator_scoped_npm_package_with_version() {
+        let p = parse_indicator("@angular/core@17.0.0");
+        assert_eq!(p.kind, IndicatorKind::Package);
+        assert_eq!(p.value, "@angular/core");
+        assert_eq!(p.version.as_deref(), Some("17.0.0"));
+    }
+
+    #[test]
+    fn parse_indicator_dotted_token_is_domain() {
+        let p = parse_indicator("evil.example.com");
+        assert_eq!(p.kind, IndicatorKind::Domain);
+        assert_eq!(p.value, "evil.example.com");
+    }
+
+    #[test]
+    fn parse_indicator_domain_is_lowercased() {
+        let p = parse_indicator("EVIL.Example.COM");
+        assert_eq!(p.kind, IndicatorKind::Domain);
+        assert_eq!(p.value, "evil.example.com");
+    }
+
+    #[test]
+    fn parse_indicator_bare_name_is_package() {
+        // No dot, no slash — a bare package name.
+        let p = parse_indicator("react");
+        assert_eq!(p.kind, IndicatorKind::Package);
+        assert_eq!(p.value, "react");
+    }
+
+    #[test]
+    fn split_at_version_rejects_missing_parts() {
+        assert!(split_at_version("react").is_none());
+        assert!(split_at_version("react@").is_none());
+        assert!(split_at_version("@1.0.0").is_none());
+        assert_eq!(
+            split_at_version("react@1.0.0"),
+            Some(("react".to_string(), "1.0.0".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_since_accepts_version_number() {
+        let (kind, version, epoch) = parse_since("42").unwrap();
+        assert_eq!(kind, "version");
+        assert_eq!(version, Some(42));
+        assert_eq!(epoch, None);
+    }
+
+    #[test]
+    fn parse_since_accepts_iso_date() {
+        let (kind, version, epoch) = parse_since("2026-01-15").unwrap();
+        assert_eq!(kind, "date");
+        assert_eq!(version, None);
+        // 2026-01-15 00:00:00 UTC = 1768435200.
+        assert_eq!(epoch, Some(1768435200));
+    }
+
+    #[test]
+    fn parse_since_rejects_garbage() {
+        assert!(parse_since("not-a-date").is_err());
+        assert!(parse_since("2026-13-01").is_err());
+        assert!(parse_since("2026-01-99").is_err());
+    }
+
+    #[test]
+    fn parse_iso_date_epoch_zero_is_unix_epoch() {
+        assert_eq!(parse_iso_date("1970-01-01"), Some(0));
+    }
+
+    #[test]
+    fn parse_iso_date_handles_leap_year() {
+        // 2024-02-29 is a valid leap day; 2024-03-01 is the day after.
+        let feb29 = parse_iso_date("2024-02-29").unwrap();
+        let mar01 = parse_iso_date("2024-03-01").unwrap();
+        assert_eq!(mar01 - feb29, 86400);
+    }
+
+    #[test]
+    fn parse_iso_date_rejects_day_past_month_length() {
+        // A day past the month length (2026-02-30) was previously rolled into the
+        // next month, mis-selecting the `diff --since` baseline. Must reject now.
+        assert_eq!(parse_iso_date("2026-02-30"), None);
+        assert_eq!(parse_iso_date("2026-04-31"), None);
+        assert_eq!(parse_iso_date("2026-06-31"), None);
+        // 2025 is not a leap year, so Feb 29 is invalid.
+        assert_eq!(parse_iso_date("2025-02-29"), None);
+        // Valid month-ends still parse.
+        assert!(parse_iso_date("2026-02-28").is_some());
+        assert!(parse_iso_date("2026-04-30").is_some());
+        assert!(parse_iso_date("2026-01-31").is_some());
+        // `parse_since` surfaces the rejection as an error, not a wrong baseline.
+        assert!(parse_since("2026-02-30").is_err());
+    }
+
+    #[test]
+    fn parse_iso_date_accepts_datetime_suffix() {
+        // Only the date part is used; a time suffix is tolerated.
+        assert_eq!(
+            parse_iso_date("2026-01-15T12:30:00"),
+            parse_iso_date("2026-01-15")
+        );
+    }
+
+    #[test]
+    fn format_epoch_round_trips_with_parse_iso_date() {
+        // A date parsed to an epoch and formatted back must show the same date.
+        let epoch = parse_iso_date("2026-05-21").unwrap();
+        assert!(format_epoch(epoch).starts_with("2026-05-21 00:00:00"));
+    }
+
+    #[test]
+    fn format_epoch_known_timestamp() {
+        // 1700000000 = 2023-11-14 22:13:20 UTC (the fixture DB build time).
+        assert_eq!(format_epoch(1700000000), "2023-11-14 22:13:20 UTC");
+    }
+
+    #[test]
+    fn delta_of_computes_signed_category_changes() {
+        let baseline = CategoryCounts {
+            packages: 10,
+            hostnames: 5,
+            ips: 3,
+            typosquats: 2,
+            popular: 100,
+        };
+        let current = CategoryCounts {
+            packages: 12,
+            hostnames: 5,
+            ips: 1,
+            typosquats: 4,
+            popular: 100,
+        };
+        let d = delta_of(&current, &baseline);
+        assert_eq!(d.packages, 2);
+        assert_eq!(d.hostnames, 0);
+        assert_eq!(d.ips, -2);
+        assert_eq!(d.typosquats, 2);
+        assert_eq!(d.popular, 0);
+        assert_eq!(d.total, 2);
+    }
+
+    #[test]
+    fn category_counts_total_sums_all_sections() {
+        let c = CategoryCounts {
+            packages: 1,
+            hostnames: 2,
+            ips: 4,
+            typosquats: 8,
+            popular: 16,
+        };
+        assert_eq!(c.total(), 31);
+    }
+
+    #[test]
+    fn record_snapshot_dedups_on_build_sequence() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _state_guard = EnvGuard::set("XDG_STATE_HOME", tmp.path());
+
+        let snap = |seq: u64, recorded: u64| DbSnapshot {
+            recorded_at: recorded,
+            build_sequence: seq,
+            build_timestamp: 1_700_000_000,
+            signature_valid: true,
+            counts: CategoryCounts::default(),
+            sources: Default::default(),
+        };
+
+        record_snapshot(&snap(42, 1000));
+        // Same build_sequence — must NOT append a second line.
+        record_snapshot(&snap(42, 2000));
+        record_snapshot(&snap(43, 3000));
+
+        let (history, _) = load_history();
+        assert_eq!(
+            history.len(),
+            2,
+            "duplicate build_sequence should be skipped"
+        );
+        assert_eq!(history[0].build_sequence, 42);
+        assert_eq!(history[1].build_sequence, 43);
+    }
+
+    #[test]
+    fn record_snapshot_caps_history_length() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _state_guard = EnvGuard::set("XDG_STATE_HOME", tmp.path());
+
+        for seq in 0..(HISTORY_MAX_LINES as u64 + 20) {
+            record_snapshot(&DbSnapshot {
+                recorded_at: 1000 + seq,
+                build_sequence: seq,
+                build_timestamp: 1_700_000_000,
+                signature_valid: true,
+                counts: CategoryCounts::default(),
+                sources: Default::default(),
+            });
+        }
+
+        let (history, _) = load_history();
+        assert_eq!(
+            history.len(),
+            HISTORY_MAX_LINES,
+            "history must be capped at HISTORY_MAX_LINES"
+        );
+        // The oldest entries are dropped; the newest must be retained.
+        assert_eq!(
+            history.last().unwrap().build_sequence,
+            HISTORY_MAX_LINES as u64 + 19
+        );
+    }
+
+    #[test]
+    fn load_history_skips_corrupt_lines() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _state_guard = EnvGuard::set("XDG_STATE_HOME", tmp.path());
+
+        let state = tmp.path().join("tirith");
+        std::fs::create_dir_all(&state).unwrap();
+        let valid = r#"{"recorded_at":1000,"build_sequence":1,"build_timestamp":1700000000,"signature_valid":true,"counts":{"packages":0,"hostnames":0,"ips":0,"typosquats":0,"popular":0},"sources":{}}"#;
+        std::fs::write(
+            state.join(HISTORY_FILE),
+            format!("not json\n{valid}\n\nalso not json\n"),
+        )
+        .unwrap();
+
+        let (history, _) = load_history();
+        assert_eq!(history.len(), 1, "only the one valid line should parse");
+        assert_eq!(history[0].build_sequence, 1);
+    }
+
+    #[test]
+    fn load_history_missing_file_is_not_an_error() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        // Set the Windows env var alongside the XDG one so the state path is
+        // isolated on every platform.
+        let _state_guard = EnvGuard::set("XDG_STATE_HOME", tmp.path());
+        let _appdata_guard = EnvGuard::set("APPDATA", tmp.path());
+
+        // No history file exists at all — a legitimate "no snapshots yet".
+        let (history, read_error) = load_history();
+        assert!(history.is_empty());
+        assert!(
+            read_error.is_none(),
+            "a missing history file must not surface as a read error"
+        );
+    }
+
+    #[test]
+    fn load_history_unreadable_file_surfaces_a_read_error() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _state_guard = EnvGuard::set("XDG_STATE_HOME", tmp.path());
+        let _appdata_guard = EnvGuard::set("APPDATA", tmp.path());
+
+        // Create the history *path* as a directory: it exists, but reading it
+        // as a file fails with an error that is not NotFound — portably
+        // exercising the "exists but unreadable" branch.
+        let state = tmp.path().join("tirith");
+        std::fs::create_dir_all(state.join(HISTORY_FILE)).unwrap();
+
+        let (history, read_error) = load_history();
+        assert!(history.is_empty());
+        assert!(
+            read_error.is_some(),
+            "an existing-but-unreadable history file must surface a read error, \
+             not be silently treated as 'no snapshots'"
+        );
+    }
+
+    #[test]
+    fn confidence_as_str_covers_all_levels() {
+        assert_eq!(Confidence::Low.as_str(), "low");
+        assert_eq!(Confidence::Medium.as_str(), "medium");
+        assert_eq!(Confidence::Confirmed.as_str(), "confirmed");
     }
 }

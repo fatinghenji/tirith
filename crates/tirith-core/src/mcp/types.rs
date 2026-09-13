@@ -1,10 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-// ---------------------------------------------------------------------------
-// JSON-RPC 2.0
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Serialize)]
 pub struct JsonRpcResponse {
     pub jsonrpc: &'static str,
@@ -43,25 +39,24 @@ impl JsonRpcResponse {
     }
 }
 
-// ---------------------------------------------------------------------------
-// MCP protocol types
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeParams {
     pub protocol_version: String,
     #[allow(dead_code)]
     pub capabilities: Value,
-    #[allow(dead_code)]
+    /// MCP `initialize.clientInfo`, read by the dispatcher to populate
+    /// [`AgentOrigin::Mcp`](crate::agent_origin::AgentOrigin::Mcp).
     pub client_info: Option<ClientInfo>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ClientInfo {
-    #[allow(dead_code)]
+    /// Caller-claimed client name (`"Claude Code"`, `"cursor"`, …). Not
+    /// verified; sanitized before it lands in
+    /// [`AgentOrigin::Mcp`](crate::agent_origin::AgentOrigin::Mcp).
     pub name: String,
-    #[allow(dead_code)]
+    /// Caller-claimed client version. Optional and sanitized.
     pub version: Option<String>,
 }
 
@@ -106,17 +101,19 @@ pub struct ToolCallParams {
     pub arguments: Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallResult {
     pub content: Vec<ContentItem>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    // M7 ch4: deserialized for the output-filter path; default false so an
+    // upstream that omits `isError` reads as "no error".
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub is_error: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub structured_content: Option<Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ContentItem {
     #[serde(rename = "type")]
     pub content_type: String,
@@ -137,7 +134,7 @@ pub struct ResourceReadParams {
     pub uri: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ResourceContent {
     pub uri: String,
     #[serde(rename = "mimeType")]
@@ -145,10 +142,7 @@ pub struct ResourceContent {
     pub text: String,
 }
 
-// ---------------------------------------------------------------------------
-// Supported protocol versions (newest first)
-// ---------------------------------------------------------------------------
-
+/// Supported MCP protocol versions, newest first.
 pub const SUPPORTED_VERSIONS: &[&str] = &[
     "2025-11-25", // Current
     "2025-06-18", // Structured tool outputs, enhanced OAuth
@@ -160,7 +154,7 @@ pub fn negotiate_version(requested: &str) -> String {
     if SUPPORTED_VERSIONS.contains(&requested) {
         requested.to_string()
     } else {
-        // Server responds with its preferred version — client decides whether to continue
+        // Unknown version — respond with our preferred and let the client decide.
         SUPPORTED_VERSIONS[0].to_string()
     }
 }

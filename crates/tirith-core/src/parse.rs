@@ -59,8 +59,7 @@ impl UrlLike {
                 if let Some(reg) = registry {
                     Some(reg.as_str())
                 } else {
-                    // Resolved default registry
-                    Some("docker.io")
+                    Some("docker.io") // distribution-spec default
                 }
             }
             UrlLike::Unparsed { raw_host, .. } => raw_host.as_deref(),
@@ -163,17 +162,16 @@ impl UrlLike {
     }
 }
 
-/// Extract raw authority (host portion) from a URL string before IDNA normalization.
-/// Handles IPv6, userinfo, port, and percent-encoded separators.
+/// Extract the raw host from a URL string BEFORE IDNA normalization (handles
+/// IPv6, userinfo, port, percent-encoded separators). Needed because
+/// `Url::parse` IDNA-normalizes the host, hiding the homograph/punycode signals
+/// the hostname rules depend on.
 pub fn extract_raw_host(url_str: &str) -> Option<String> {
-    // Find the authority section: after "scheme://"
-    let after_scheme = if let Some(idx) = url_str.find("://") {
+    let after_scheme = {
+        let idx = leading_scheme_separator(url_str)?;
         &url_str[idx + 3..]
-    } else {
-        return None;
     };
 
-    // Find end of authority (first `/`, `?`, `#`, or end of string)
     let authority_end = after_scheme
         .find(['/', '?', '#'])
         .unwrap_or(after_scheme.len());
@@ -183,24 +181,35 @@ pub fn extract_raw_host(url_str: &str) -> Option<String> {
         return Some(String::new());
     }
 
-    // Split off userinfo: find LAST unencoded `@`
     let host_part = split_userinfo(authority);
-
-    // Extract host from host_part (handle IPv6, port)
     let host = extract_host_from_hostport(host_part);
 
     Some(host.to_string())
 }
 
-/// Split userinfo from authority, returning the host+port part.
-/// Finds the last unencoded `@` (percent-encoded `%40` is NOT a separator).
+/// Return the `://` byte offset only when it terminates a syntactically valid
+/// URI scheme that begins at byte zero. An embedded `://` in an SCP remote path
+/// is data, not a scheme delimiter (`git@host://path`).
+fn leading_scheme_separator(raw: &str) -> Option<usize> {
+    let idx = raw.find("://")?;
+    let scheme = &raw[..idx];
+    let mut chars = scheme.chars();
+    if !chars.next().is_some_and(|ch| ch.is_ascii_alphabetic()) {
+        return None;
+    }
+    chars
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+        .then_some(idx)
+}
+
+/// Split userinfo from authority on the LAST unencoded `@` (so `user%40name@host`
+/// resolves to `host` — `%40` is userinfo, not a separator).
 fn split_userinfo(authority: &str) -> &str {
     let bytes = authority.as_bytes();
     let mut last_at = None;
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            // Skip percent-encoded triplet
             i += 3;
             continue;
         }
@@ -218,14 +227,12 @@ fn split_userinfo(authority: &str) -> &str {
 /// Extract host from a host:port string, handling IPv6 brackets.
 fn extract_host_from_hostport(hostport: &str) -> &str {
     if hostport.starts_with('[') {
-        // IPv6: find closing bracket
         if let Some(bracket_end) = hostport.find(']') {
             return &hostport[..bracket_end + 1];
         }
         return hostport;
     }
 
-    // Find last unencoded `:` for port separation
     let bytes = hostport.as_bytes();
     let mut last_colon = None;
     let mut i = 0;
@@ -242,7 +249,7 @@ fn extract_host_from_hostport(hostport: &str) -> &str {
 
     match last_colon {
         Some(idx) => {
-            // Verify what follows looks like a port number
+            // Colon is a port separator only when the suffix is all digits.
             let after = &hostport[idx + 1..];
             if after.chars().all(|c| c.is_ascii_digit()) && !after.is_empty() {
                 &hostport[..idx]
@@ -256,18 +263,16 @@ fn extract_host_from_hostport(hostport: &str) -> &str {
 
 /// Parse a URL string into a UrlLike.
 pub fn parse_url(raw: &str) -> UrlLike {
-    // Try SCP-style git reference: user@host:path (no scheme)
+    // SCP refs (`git@host:path`) must be matched before generic `Url::parse`.
     if let Some(scp) = try_parse_scp(raw) {
         return scp;
     }
 
-    // Try standard URL parsing
     if let Ok(parsed) = Url::parse(raw) {
         let raw_host = extract_raw_host(raw).unwrap_or_default();
         return UrlLike::Standard { parsed, raw_host };
     }
 
-    // Fallback: try to extract raw components
     let raw_host = extract_raw_host(raw);
     let raw_path = extract_raw_path(raw);
     UrlLike::Unparsed {
@@ -277,27 +282,21 @@ pub fn parse_url(raw: &str) -> UrlLike {
     }
 }
 
-/// Try to parse as SCP-style reference: [user@]host:path
+/// Try to parse as SCP-style reference: `[user@]host:path`.
 fn try_parse_scp(raw: &str) -> Option<UrlLike> {
-    // Must not have a scheme
-    if raw.contains("://") {
+    if leading_scheme_separator(raw).is_some() {
         return None;
     }
 
-    // Pattern: [user@]host:path where path doesn't start with //
     let (user_host, path) = raw.split_once(':')?;
-    if path.starts_with("//") {
-        return None; // Looks like a scheme-relative URL
-    }
 
-    // Must have a host that looks like a domain
     let (user, host) = if let Some((u, h)) = user_host.split_once('@') {
         (Some(u.to_string()), h)
     } else {
         (None, user_host)
     };
 
-    // Host must contain a dot or be a known hostname pattern
+    // Require a dot or `localhost` so `foo:bar` shell syntax isn't an SCP ref.
     if !host.contains('.') && host != "localhost" {
         return None;
     }
@@ -315,41 +314,35 @@ pub fn parse_docker_ref(raw: &str) -> UrlLike {
     let mut digest = None;
     let mut tag = None;
 
-    // Extract digest (@sha256:...)
     if let Some(at_idx) = remaining.rfind('@') {
         digest = Some(remaining[at_idx + 1..].to_string());
         remaining = &remaining[..at_idx];
     }
 
-    // Extract tag (:tag)
     if let Some(colon_idx) = remaining.rfind(':') {
         let potential_tag = &remaining[colon_idx + 1..];
-        // Tag must not contain '/' (that would be registry:port)
         let before_colon = &remaining[..colon_idx];
-        // If the part after colon contains no '/' and the part before contains no ':',
-        // or if this is clearly a tag (no dots in tag portion)
+        // A `/` in the suffix means this colon is a registry:port, not a tag.
         if !potential_tag.contains('/') {
             tag = Some(potential_tag.to_string());
             remaining = before_colon;
         }
     }
 
-    // Split into components
     let parts: Vec<&str> = remaining.split('/').collect();
 
     let (registry, image) = if parts.len() == 1 {
-        // Single component: nginx -> docker.io/library/nginx
+        // `nginx` → implicit `library/nginx`.
         (None, format!("library/{}", parts[0]))
     } else {
-        // Check if first component is a registry
         let first = parts[0];
+        // A host-like first segment (`.`/`:` or `localhost`) is a registry.
         let is_registry = first.contains('.') || first.contains(':') || first == "localhost";
 
         if is_registry {
             let image_parts = &parts[1..];
             (Some(first.to_string()), image_parts.join("/"))
         } else {
-            // All parts form the image name, default registry
             (None, parts.join("/"))
         }
     };
@@ -451,6 +444,23 @@ mod tests {
         assert!(matches!(u, UrlLike::Scp { .. }));
         assert_eq!(u.host(), Some("github.com"));
         assert_eq!(u.path(), Some("user/repo.git"));
+    }
+
+    #[test]
+    fn scp_remote_path_may_contain_scheme_delimiters() {
+        let raw = "git@evil.example://github.com/org/repo.git";
+        let parsed = parse_url(raw);
+        assert!(matches!(parsed, UrlLike::Scp { .. }));
+        assert_eq!(parsed.host(), Some("evil.example"));
+        assert_eq!(parsed.path(), Some("//github.com/org/repo.git"));
+        assert_eq!(extract_raw_host(raw), None);
+    }
+
+    #[test]
+    fn a_real_leading_scheme_is_not_parsed_as_scp() {
+        let parsed = parse_url("HTTPS://example.com/a:b");
+        assert!(matches!(parsed, UrlLike::Standard { .. }));
+        assert_eq!(parsed.host(), Some("example.com"));
     }
 
     #[test]

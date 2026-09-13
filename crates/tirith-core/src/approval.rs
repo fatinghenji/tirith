@@ -1,8 +1,47 @@
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 use crate::policy::{ApprovalRule, Policy};
 use crate::verdict::Verdict;
+
+/// Approval/warn-ack temp files older than this are abandoned (e.g. an
+/// `--approval-check` run with no hook reading it) and removed on the next
+/// write. A live hook reads + deletes within seconds, so an hour won't race.
+const STALE_APPROVAL_TTL: Duration = Duration::from_secs(3600);
+
+/// Best-effort cleanup of leaked approval/warn-ack temp files in `$TEMP`, run
+/// before each fresh write. Errors are ignored — housekeeping, not required.
+fn cleanup_stale_temp_files() {
+    let dir = std::env::temp_dir();
+    let now = SystemTime::now();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".env") {
+            continue;
+        }
+        if !(name.starts_with("tirith-approval-") || name.starts_with("tirith-warnack-")) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age > STALE_APPROVAL_TTL {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
 
 /// Approval metadata extracted from a verdict + policy.
 #[derive(Debug, Clone)]
@@ -14,16 +53,14 @@ pub struct ApprovalMetadata {
     pub description: String,
 }
 
-/// Check whether a verdict triggers any approval rules from the policy.
-///
-/// Returns `Some(ApprovalMetadata)` if approval is required, `None` otherwise.
-/// This is a Team-tier feature: callers should gate on tier before calling.
+/// `Some(ApprovalMetadata)` if a verdict triggers any policy approval rule.
+/// Team-tier feature: callers should gate on tier before calling.
 pub fn check_approval(verdict: &Verdict, policy: &Policy) -> Option<ApprovalMetadata> {
     if policy.approval_rules.is_empty() {
         return None;
     }
 
-    // Check each finding's rule_id against approval_rules
+    let mut combined: Option<ApprovalMetadata> = None;
     for finding in &verdict.findings {
         let finding_rule_str = finding.rule_id.to_string();
         for approval_rule in &policy.approval_rules {
@@ -33,22 +70,82 @@ pub fn check_approval(verdict: &Verdict, policy: &Policy) -> Option<ApprovalMeta
                 } else {
                     finding.description.clone()
                 };
-                return Some(ApprovalMetadata {
+                let candidate = ApprovalMetadata {
                     requires_approval: true,
                     timeout_secs: approval_rule.timeout_secs,
                     fallback: approval_rule.fallback.clone(),
-                    rule_id: finding_rule_str,
+                    rule_id: finding_rule_str.clone(),
                     description: sanitize_description(&description),
-                });
+                };
+                match &mut combined {
+                    None => combined = Some(candidate),
+                    Some(current) => {
+                        let current_rank = fallback_rank(&current.fallback);
+                        let candidate_rank = fallback_rank(&candidate.fallback);
+                        let candidate_has_stricter_timeout = current.timeout_secs != 0
+                            && (candidate.timeout_secs == 0
+                                || candidate.timeout_secs > current.timeout_secs);
+                        if candidate_rank > current_rank
+                            || (candidate_rank == current_rank && candidate_has_stricter_timeout)
+                        {
+                            current.rule_id = candidate.rule_id.clone();
+                            current.description = candidate.description.clone();
+                        }
+                        if candidate_rank > current_rank {
+                            current.fallback = candidate.fallback;
+                        }
+                        current.timeout_secs =
+                            if current.timeout_secs == 0 || candidate.timeout_secs == 0 {
+                                0
+                            } else {
+                                current.timeout_secs.max(candidate.timeout_secs)
+                            };
+                    }
+                }
             }
         }
     }
 
-    None
+    combined
+}
+
+fn fallback_rank(value: &str) -> u8 {
+    match value {
+        "allow" => 0,
+        "warn" => 1,
+        // Unknown values are interpreted fail-closed by the execution surface;
+        // rank them with block so merging cannot replace them with permission.
+        _ => 2,
+    }
 }
 
 /// Apply approval metadata to a verdict (mutates in place).
+///
+/// Approval contracts compose monotonically. In particular, a generic approval
+/// rule must not replace an engine-native Web3 `fallback=block` contract with an
+/// allow/warn fallback merely because its finding was encountered first.
 pub fn apply_approval(verdict: &mut Verdict, metadata: &ApprovalMetadata) {
+    if verdict.requires_approval == Some(true) {
+        let existing_fallback = verdict.approval_fallback.as_deref().unwrap_or("block");
+        let new_is_stricter = fallback_rank(&metadata.fallback) > fallback_rank(existing_fallback);
+        if new_is_stricter {
+            verdict.approval_fallback = Some(metadata.fallback.clone());
+            verdict.approval_rule = Some(metadata.rule_id.clone());
+            verdict.approval_description = Some(metadata.description.clone());
+        }
+
+        // Zero is an unbounded wait and therefore never reaches a permissive
+        // fallback. Otherwise, retaining the longer timeout is monotonic for an
+        // approval gate: it cannot cause execution sooner without approval.
+        let existing_timeout = verdict.approval_timeout_secs.unwrap_or(0);
+        verdict.approval_timeout_secs =
+            Some(if existing_timeout == 0 || metadata.timeout_secs == 0 {
+                0
+            } else {
+                existing_timeout.max(metadata.timeout_secs)
+            });
+        return;
+    }
     verdict.requires_approval = Some(metadata.requires_approval);
     verdict.approval_timeout_secs = Some(metadata.timeout_secs);
     verdict.approval_fallback = Some(metadata.fallback.clone());
@@ -56,21 +153,16 @@ pub fn apply_approval(verdict: &mut Verdict, metadata: &ApprovalMetadata) {
     verdict.approval_description = Some(metadata.description.clone());
 }
 
-/// Write approval metadata to a secure temp file.
-///
-/// Returns the path to the temp file. The caller is responsible for printing
-/// this path to stdout. The temp file is persisted (not auto-deleted) so
-/// shell hooks can read it after tirith exits.
-///
-/// Per ADR-7: file is created with O_EXCL + O_CREAT (via tempfile crate),
-/// mode 0600 on Unix, and `.keep()` is called before returning.
+/// Write approval metadata to a secure temp file and return its path. The file
+/// is persisted (not auto-deleted) so shell hooks can read it after tirith exits.
+/// Per ADR-7: O_EXCL + O_CREAT, mode 0600 on Unix, `.keep()` before return.
 pub fn write_approval_file(metadata: &ApprovalMetadata) -> Result<PathBuf, std::io::Error> {
+    cleanup_stale_temp_files();
     let mut tmp = tempfile::Builder::new()
         .prefix("tirith-approval-")
         .suffix(".env")
         .tempfile()?;
 
-    // Set permissions to 0600 on Unix before writing content
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -78,7 +170,6 @@ pub fn write_approval_file(metadata: &ApprovalMetadata) -> Result<PathBuf, std::
         std::fs::set_permissions(tmp.path(), perms)?;
     }
 
-    // Write key=value pairs
     writeln!(
         tmp,
         "TIRITH_REQUIRES_APPROVAL={}",
@@ -107,13 +198,14 @@ pub fn write_approval_file(metadata: &ApprovalMetadata) -> Result<PathBuf, std::
 
     tmp.flush()?;
 
-    // Persist the file (prevent auto-delete on drop)
+    // `.keep()` prevents auto-delete so shell hooks can read it after exit.
     let (_, path) = tmp.keep().map_err(|e| e.error)?;
     Ok(path)
 }
 
 /// Write a "no approval required" temp file for the common case.
 pub fn write_no_approval_file() -> Result<PathBuf, std::io::Error> {
+    cleanup_stale_temp_files();
     let mut tmp = tempfile::Builder::new()
         .prefix("tirith-approval-")
         .suffix(".env")
@@ -133,15 +225,14 @@ pub fn write_no_approval_file() -> Result<PathBuf, std::io::Error> {
     Ok(path)
 }
 
-/// Write warn-ack metadata to a secure temp file for hook-driven strict_warn.
-///
-/// The shell hook reads this file to know how many warnings need acknowledgement
-/// and the maximum severity. Follows the same security pattern as
-/// `write_approval_file()`: O_EXCL + O_CREAT, mode 0600, `.keep()` before return.
+/// Write warn-ack metadata (count + max severity) to a secure temp file for
+/// hook-driven strict_warn. Same security pattern as `write_approval_file()`:
+/// O_EXCL + O_CREAT, mode 0600, `.keep()` before return.
 pub fn write_warn_ack_file(
     finding_count: usize,
     max_severity: &crate::verdict::Severity,
 ) -> Result<PathBuf, std::io::Error> {
+    cleanup_stale_temp_files();
     let mut tmp = tempfile::Builder::new()
         .prefix("tirith-warnack-")
         .suffix(".env")
@@ -169,10 +260,8 @@ fn approval_rule_matches(rule_id_str: &str, approval_rule: &ApprovalRule) -> boo
     approval_rule.rule_ids.iter().any(|r| r == rule_id_str)
 }
 
-/// Sanitize a description string per ADR-7.
-///
-/// Allowlist: `[A-Za-z0-9 .,_:/()\-']`. All other characters stripped.
-/// Consecutive spaces collapsed. Max 200 bytes, truncated with `...`.
+/// Sanitize a description per ADR-7: allowlist `[A-Za-z0-9 .,_:/()\-']`,
+/// collapse consecutive spaces, cap at 200 bytes (truncated with `...`).
 pub fn sanitize_description(input: &str) -> String {
     let filtered: String = input
         .chars()
@@ -185,7 +274,7 @@ pub fn sanitize_description(input: &str) -> String {
         })
         .collect();
 
-    // Collapse consecutive spaces
+    // Collapse consecutive spaces.
     let mut result = String::with_capacity(filtered.len());
     let mut prev_space = false;
     for c in filtered.chars() {
@@ -200,9 +289,8 @@ pub fn sanitize_description(input: &str) -> String {
         }
     }
 
-    // Truncate to 200 bytes
     if result.len() > 200 {
-        // Find a safe UTF-8 boundary
+        // Truncate at a UTF-8 char boundary.
         let mut end = 197;
         while end > 0 && !result.is_char_boundary(end) {
             end -= 1;
@@ -214,11 +302,9 @@ pub fn sanitize_description(input: &str) -> String {
     result
 }
 
-/// Sanitize the approval fallback value per ADR-7.
-///
-/// Only "block", "warn", and "allow" are valid. Any other value
-/// (including values containing newlines, `=`, or shell metacharacters)
-/// defaults to "block" for fail-closed safety.
+/// Sanitize the approval fallback per ADR-7: only "block"/"warn"/"allow" are
+/// valid; anything else (newlines, `=`, shell metachars) defaults to "block"
+/// (fail-closed).
 fn sanitize_fallback(input: &str) -> &'static str {
     match input.trim().to_lowercase().as_str() {
         "block" => "block",
@@ -274,6 +360,8 @@ mod tests {
             approval_rule: None,
             approval_description: None,
             escalation_reason: None,
+            agent_origin: None,
+            manifest_allowed_match: None,
         }
     }
 
@@ -313,10 +401,68 @@ mod tests {
     #[test]
     fn test_check_approval_empty_rules() {
         let verdict = make_verdict(RuleId::CurlPipeShell, Severity::High);
-        let policy = Policy::default(); // no approval_rules
+        let policy = Policy::default();
 
         let meta = check_approval(&verdict, &policy);
         assert!(meta.is_none());
+    }
+
+    #[test]
+    fn check_approval_composes_all_matches_monotonically() {
+        let mut verdict = make_verdict(RuleId::CurlPipeShell, Severity::High);
+        let mut second = make_verdict(RuleId::DataExfiltration, Severity::Critical);
+        verdict.findings.push(second.findings.remove(0));
+        let mut policy = Policy {
+            approval_rules: vec![
+                ApprovalRule {
+                    rule_ids: vec!["curl_pipe_shell".to_string()],
+                    timeout_secs: 1,
+                    fallback: "allow".to_string(),
+                },
+                ApprovalRule {
+                    rule_ids: vec!["data_exfiltration".to_string()],
+                    timeout_secs: 0,
+                    fallback: "block".to_string(),
+                },
+            ],
+            ..Policy::default()
+        };
+
+        let metadata = check_approval(&verdict, &policy).expect("both rules match");
+        assert_eq!(metadata.fallback, "block");
+        assert_eq!(metadata.timeout_secs, 0);
+        assert_eq!(metadata.rule_id, "data_exfiltration");
+
+        verdict.findings.reverse();
+        policy.approval_rules.reverse();
+        let reordered = check_approval(&verdict, &policy).expect("both rules still match");
+        assert_eq!(reordered.fallback, "block");
+        assert_eq!(reordered.timeout_secs, 0);
+        assert_eq!(reordered.rule_id, "data_exfiltration");
+    }
+
+    #[test]
+    fn check_approval_composes_overlapping_rules_for_one_finding() {
+        let verdict = make_verdict(RuleId::CurlPipeShell, Severity::High);
+        let policy = Policy {
+            approval_rules: vec![
+                ApprovalRule {
+                    rule_ids: vec!["curl_pipe_shell".to_string()],
+                    timeout_secs: 15,
+                    fallback: "warn".to_string(),
+                },
+                ApprovalRule {
+                    rule_ids: vec!["curl_pipe_shell".to_string()],
+                    timeout_secs: 30,
+                    fallback: "block".to_string(),
+                },
+            ],
+            ..Policy::default()
+        };
+
+        let metadata = check_approval(&verdict, &policy).expect("both rules match");
+        assert_eq!(metadata.fallback, "block");
+        assert_eq!(metadata.timeout_secs, 30);
     }
 
     #[test]
@@ -353,11 +499,9 @@ mod tests {
 
     #[test]
     fn test_sanitize_rule_id() {
-        // Normal snake_case (from serde serialization) passes through
         assert_eq!(sanitize_rule_id("curl_pipe_shell"), "curl_pipe_shell");
         // Uppercase letters are stripped (only [a-z_] allowed)
         assert_eq!(sanitize_rule_id("CurlPipeShell"), "urlipehell");
-        // Truncates to 64 chars
         assert_eq!(sanitize_rule_id(&"a".repeat(100)), "a".repeat(64));
     }
 
@@ -368,7 +512,7 @@ mod tests {
         assert_eq!(sanitize_fallback("allow"), "allow");
         assert_eq!(sanitize_fallback("BLOCK"), "block");
         assert_eq!(sanitize_fallback("  warn  "), "warn");
-        // Malicious values default to "block"
+        // Malicious values default to "block" (fail-closed).
         assert_eq!(sanitize_fallback("block\nINJECTED=yes"), "block");
         assert_eq!(
             sanitize_fallback("allow\r\nTIRITH_REQUIRES_APPROVAL=no"),
@@ -397,6 +541,38 @@ mod tests {
     }
 
     #[test]
+    fn generic_approval_cannot_weaken_engine_native_block_fallback() {
+        let mut verdict = make_verdict(RuleId::Web3NetworkPolicyViolation, Severity::Medium);
+        verdict.requires_approval = Some(true);
+        verdict.approval_timeout_secs = Some(0);
+        verdict.approval_fallback = Some("block".to_string());
+        verdict.approval_rule = Some("web3_network_policy_violation".to_string());
+        verdict.approval_description = Some("Web3 policy approval".to_string());
+
+        apply_approval(
+            &mut verdict,
+            &ApprovalMetadata {
+                requires_approval: true,
+                timeout_secs: 1,
+                fallback: "allow".to_string(),
+                rule_id: "data_exfiltration".to_string(),
+                description: "generic approval".to_string(),
+            },
+        );
+
+        assert_eq!(verdict.approval_timeout_secs, Some(0));
+        assert_eq!(verdict.approval_fallback.as_deref(), Some("block"));
+        assert_eq!(
+            verdict.approval_rule.as_deref(),
+            Some("web3_network_policy_violation")
+        );
+        assert_eq!(
+            verdict.approval_description.as_deref(),
+            Some("Web3 policy approval")
+        );
+    }
+
+    #[test]
     fn test_write_approval_file() {
         let meta = ApprovalMetadata {
             requires_approval: true,
@@ -416,7 +592,6 @@ mod tests {
         assert!(content.contains("TIRITH_APPROVAL_RULE=curl_pipe_shell"));
         assert!(content.contains("TIRITH_APPROVAL_DESCRIPTION=Pipe to shell detected"));
 
-        // Verify file permissions on Unix
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -424,7 +599,6 @@ mod tests {
             assert_eq!(perms.mode() & 0o777, 0o600);
         }
 
-        // Cleanup
         let _ = std::fs::remove_file(&path);
     }
 
@@ -458,5 +632,64 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_approval_file_cleans_up_stale_leaks() {
+        // Regression: leaked `tirith-approval-*.env` files older than the TTL
+        // must be removed on the next write, but fresh files (a concurrent hook
+        // may be reading them) and unrelated files must be left alone.
+        use std::fs::File;
+        use std::time::{Duration, SystemTime};
+
+        let dir = std::env::temp_dir();
+
+        // Unique-enough suffix so parallel runs of this suite don't interfere.
+        let suffix = format!("{}-{}", std::process::id(), rand_token());
+        let stale = dir.join(format!("tirith-approval-stale-{suffix}.env"));
+        let fresh = dir.join(format!("tirith-approval-fresh-{suffix}.env"));
+        let unrelated = dir.join(format!("tirith-other-{suffix}.env"));
+
+        File::create(&stale).expect("stale create");
+        File::create(&fresh).expect("fresh create");
+        File::create(&unrelated).expect("unrelated create");
+
+        // Backdate the stale file past the TTL.
+        let two_hours_ago = SystemTime::now() - Duration::from_secs(7200);
+        File::options()
+            .write(true)
+            .open(&stale)
+            .and_then(|f| f.set_modified(two_hours_ago))
+            .expect("backdate stale");
+
+        let meta = ApprovalMetadata {
+            requires_approval: true,
+            timeout_secs: 0,
+            fallback: "block".to_string(),
+            rule_id: "test".to_string(),
+            description: "test".to_string(),
+        };
+        let new_path = write_approval_file(&meta).expect("write should succeed");
+
+        assert!(!stale.exists(), "stale leak should be cleaned up");
+        assert!(fresh.exists(), "fresh file (within TTL) must be left alone");
+        assert!(
+            unrelated.exists(),
+            "unrelated file (wrong prefix) must be left alone"
+        );
+        assert!(new_path.exists(), "new approval file must exist");
+
+        let _ = std::fs::remove_file(&fresh);
+        let _ = std::fs::remove_file(&unrelated);
+        let _ = std::fs::remove_file(&new_path);
+    }
+
+    fn rand_token() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{nanos:x}")
     }
 }

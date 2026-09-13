@@ -1,6 +1,6 @@
-// Embedded data from build.rs: known domains, popular repos, OCR confusions.
+//! Embedded lookup tables (known domains, popular repos, OCR confusions,
+//! public suffix list) compiled by `build.rs`.
 
-// Include generated data
 include!(concat!(env!("OUT_DIR"), "/known_domains_gen.rs"));
 include!(concat!(env!("OUT_DIR"), "/popular_repos_gen.rs"));
 include!(concat!(env!("OUT_DIR"), "/psl_gen.rs"));
@@ -45,19 +45,16 @@ pub fn registrable_domain(host: &str) -> Option<String> {
     if labels.len() < 2 {
         return None;
     }
-    // Try multi-part suffixes first (longest match)
+    // Longest-suffix match first so multi-label suffixes (`co.uk`) win.
     for i in 0..labels.len() {
         let suffix = labels[i..].join(".");
         if is_public_suffix(&suffix) {
             if i == 0 {
-                // Entire hostname is a public suffix
                 return None;
             }
-            // eTLD+1 = one label before the suffix + suffix
             return Some(labels[i - 1..].join("."));
         }
     }
-    // Fallback: treat last label as TLD
     if labels.len() >= 2 {
         Some(labels[labels.len() - 2..].join("."))
     } else {

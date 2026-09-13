@@ -1,19 +1,19 @@
-//! One-shot test to generate the Ed25519 keypair and test threat DB fixture.
+//! One-shot generator for the Ed25519 keypair and test threat DB fixture.
 //!
 //! Run with: `cargo test -p tirith-core --test generate_test_fixtures -- --ignored`
 //!
-//! This generates:
-//!   - `assets/keys/threatdb-verify.pub` (32-byte raw Ed25519 public key)
-//!   - `<repo>/threatdb-signing.key` (base64-encoded private key, gitignored)
-//!   - `<repo>/tests/fixtures/test-threatdb.dat` (signed test DB)
+//! Generates `assets/keys/threatdb-verify.pub` (raw public key),
+//! `<repo>/threatdb-signing.key` (base64 private key, gitignored), and
+//! `<repo>/tests/fixtures/test-threatdb.dat` (signed test DB).
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 
 use tirith_core::threatdb::{Confidence, Ecosystem, ThreatDbWriter, ThreatSource};
+use tirith_core::util::ContainedAtomicFile;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -28,23 +28,32 @@ fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Generate a fresh Ed25519 keypair, write the public key to the assets
-/// directory (embedded in the binary via `include_bytes!`), and write the
-/// private key as base64 to the repo root (gitignored).
+fn write_private_key(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private key path has no parent",
+        )
+    })?;
+    let destination = ContainedAtomicFile::prepare(parent, path, false)?;
+    let mut reader = bytes;
+    destination.write_atomic_from_reader(&mut reader, true, Some(0o600))
+}
+
+/// Generate a fresh Ed25519 keypair: write the public key to assets (embedded
+/// via `include_bytes!`) and the base64 private key to the repo root (gitignored).
 fn generate_keypair() -> SigningKey {
     let signing_key = SigningKey::generate(&mut OsRng);
 
-    // Write 32-byte raw public key
     let pub_path = crate_root().join("assets/keys/threatdb-verify.pub");
     std::fs::write(&pub_path, signing_key.verifying_key().as_bytes())
         .unwrap_or_else(|e| panic!("Failed to write {}: {}", pub_path.display(), e));
     eprintln!("Wrote public key to {}", pub_path.display());
 
-    // Write base64-encoded private key (secret bytes only, 32 bytes -> base64)
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD.encode(signing_key.to_bytes());
     let key_path = repo_root().join("threatdb-signing.key");
-    std::fs::write(&key_path, &b64)
+    write_private_key(&key_path, b64.as_bytes())
         .unwrap_or_else(|e| panic!("Failed to write {}: {}", key_path.display(), e));
     eprintln!("Wrote private key to {}", key_path.display());
 
@@ -55,7 +64,6 @@ fn generate_keypair() -> SigningKey {
 fn build_test_db(signing_key: &SigningKey) {
     let mut writer = ThreatDbWriter::new(1700000000, 42);
 
-    // Malicious packages
     writer.add_package(
         Ecosystem::Npm,
         "evil-package",
@@ -84,14 +92,12 @@ fn build_test_db(signing_key: &SigningKey) {
         Some("https://example.com/advisory/borderline-pkg"),
     );
 
-    // C2 IP
     writer.add_ip(Ipv4Addr::new(203, 0, 113, 50), ThreatSource::FeodoTracker);
 
-    // Typosquats
     writer.add_typosquat(Ecosystem::Npm, "reacct", "react");
     writer.add_typosquat(Ecosystem::PyPI, "reqeusts", "requests");
 
-    // Popular packages (for Levenshtein distance checks)
+    // Popular packages for Levenshtein distance checks.
     writer.add_popular(Ecosystem::Npm, "react");
     writer.add_popular(Ecosystem::Npm, "express");
     writer.add_popular(Ecosystem::PyPI, "requests");
@@ -103,11 +109,8 @@ fn build_test_db(signing_key: &SigningKey) {
         .unwrap_or_else(|e| panic!("Failed to write test DB: {}", e));
     eprintln!("Wrote test DB to {}", dat_path.display());
 
-    // Verify the DB can be loaded (format/structure check).
-    // Note: verify_signature() would fail here because the embedded public key
-    // (include_bytes!) still has the old value from compile time. Signature
-    // verification against the embedded key works after recompilation.
-    // Instead, verify the signature manually using the key we just generated.
+    // Structural reload only: verify_signature() fails until a rebuild embeds
+    // the freshly-written public key via `include_bytes!`.
     let db = tirith_core::threatdb::ThreatDb::load_from_path(&dat_path, 0)
         .expect("Failed to reload test DB");
     let stats = db.stats();
@@ -123,9 +126,48 @@ fn build_test_db(signing_key: &SigningKey) {
 }
 
 #[test]
-#[ignore] // Run manually: `cargo test -p tirith-core --test generate_test_fixtures -- --ignored`
+#[ignore = "one-shot generator, run manually with --ignored"]
 fn generate_keypair_and_test_db() {
     let key = generate_keypair();
     build_test_db(&key);
     eprintln!("Done. Now rebuild tirith-core to embed the new public key.");
+}
+
+#[cfg(unix)]
+#[test]
+fn private_key_create_and_update_are_exactly_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let key_path = directory.path().join("threatdb-signing.key");
+
+    write_private_key(&key_path, b"first key").unwrap();
+    let created_mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(created_mode, 0o600);
+
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    write_private_key(&key_path, b"replacement key").unwrap();
+    let updated_mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(updated_mode, 0o600);
+    assert_eq!(std::fs::read(&key_path).unwrap(), b"replacement key");
+}
+
+#[cfg(unix)]
+#[test]
+fn private_key_write_refuses_a_symlink_destination() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let victim = directory.path().join("victim");
+    let key_path = directory.path().join("threatdb-signing.key");
+    std::fs::write(&victim, b"preserve me").unwrap();
+    symlink(&victim, &key_path).unwrap();
+
+    write_private_key(&key_path, b"replacement key").unwrap_err();
+
+    assert_eq!(std::fs::read(&victim).unwrap(), b"preserve me");
+    assert!(std::fs::symlink_metadata(&key_path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
 }

@@ -20,10 +20,62 @@ if (-not $env:TIRITH_SESSION_ID) {
     $env:TIRITH_SESSION_ID = '{0:x}-{1:x}' -f $PID, [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 }
 
+# M8 ch2 — surface "this shell is on the remote side of an SSH session" to
+# `tirith prompt-status` (planned for M8 ch6) and any other downstream
+# consumer. Set NOW so chunk 6 can read it without a follow-up hook patch.
+# Standard SSH env vars: SSH_CONNECTION, SSH_CLIENT, SSH_TTY. PowerShell on
+# Windows rarely sees these but PowerShell 7+ via OpenSSH does.
+if ((-not $env:TIRITH_SSH_REMOTE) -and ($env:SSH_CONNECTION -or $env:SSH_CLIENT -or $env:SSH_TTY)) {
+    $env:TIRITH_SSH_REMOTE = '1'
+}
+
+# Interactivity gate: the hook only intercepts commands typed at a prompt and
+# pasted text, so it must be a complete no-op in a non-interactive PowerShell
+# (`pwsh -c …`, `pwsh -File …`, a CI step). `[Environment]::UserInteractive`
+# is false there. A non-interactive child must inherit nothing from tirith.
+if (-not [Environment]::UserInteractive) {
+    return
+}
+
+# Resolve the trusted executable once while the interactive hook is loaded.
+# Repository-local PATH changes made by a later command must not redirect the
+# security hook into an attacker-controlled `tirith` shim.
+$tirithCommand = Get-Command tirith -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if ($null -eq $tirithCommand -or [string]::IsNullOrWhiteSpace($tirithCommand.Source)) {
+    Write-Host 'tirith: executable not found; PowerShell hooks disabled' -ForegroundColor Yellow
+    $global:TIRITH_STATUS = 'off'
+    return
+}
+$global:_TIRITH_BIN = [System.IO.Path]::GetFullPath($tirithCommand.Source)
+
+# M9 ch4 — record a shell-start environment snapshot for `tirith env diff`.
+# Start a background job that execs a hidden tirith subcommand; the child reads
+# ITS OWN inherited environment and writes ONLY variable names + an 8-char
+# value-hash prefix (never raw values, never a recoverable hash) to
+# <state-dir>/env_snapshot.json. No value crosses an argv boundary or a temp
+# file. Backgrounded via Start-Job so it never blocks the prompt; errors are
+# swallowed so a missing binary never disrupts the shell. Runs once per session
+# (this hook is sourced once per shell start).
+try {
+    Start-Job -ScriptBlock {
+        param([string]$TirithBin)
+        & $TirithBin env snapshot 2>$null 1>$null
+    } -ArgumentList $global:_TIRITH_BIN | Out-Null
+} catch {
+    # Ignore — the snapshot is best-effort and must never break the shell.
+}
+
 # Check for PSReadLine
 $psrlModule = Get-Module PSReadLine -ErrorAction SilentlyContinue
 if (-not $psrlModule) {
     Write-Host "tirith: PSReadLine not found, hooks disabled. Install PSReadLine for shell protection." -ForegroundColor Yellow
+    # TIRITH_STATUS: opt-in prompt indicator (see docs/prompt-status.md). With
+    # no PSReadLine, no key handler is installed and tirith intercepts nothing,
+    # so the live protection level is `off`. Set as a session-scoped
+    # `$global:` variable — deliberately NOT `$env:`, which would export it to
+    # child processes that have no tirith protection of their own.
+    $global:TIRITH_STATUS = 'off'
     return
 }
 
@@ -35,7 +87,6 @@ function global:_tirith_escape_preview {
     return (ConvertTo-Json -Compress -InputObject ([string]$Text))
 }
 
-# --- Approval workflow helpers (ADR-7) ---
 
 function global:_tirith_parse_approval {
     param($FilePath)
@@ -47,7 +98,7 @@ function global:_tirith_parse_approval {
 
     if (-not (Test-Path $FilePath -ErrorAction SilentlyContinue)) {
         [Console]::Error.WriteLine("tirith: warning: approval file missing or unreadable, failing closed")
-        Remove-Item $FilePath -Force -ErrorAction SilentlyContinue  # ADR-7: delete on all paths
+        Remove-Item $FilePath -Force -ErrorAction SilentlyContinue  # delete on all paths
         $script:_tirith_ap_required = "yes"
         $script:_tirith_ap_fallback = "block"
         return $false
@@ -119,7 +170,6 @@ function global:_tirith_read_with_timeout {
     return $buffer
 }
 
-# --- Warn-ack helpers (strict_warn, exit code 3) ---
 
 function global:_tirith_parse_warn_ack {
     param($FilePath)
@@ -169,8 +219,14 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
 
     # Run tirith check with approval workflow (stdout=approval file path, stderr=human output)
     $errfile = [System.IO.Path]::GetTempFileName()
-    $approvalPath = & tirith check --approval-check --non-interactive --interactive --shell powershell -- $line 2>$errfile
-    $rc = $LASTEXITCODE
+    $prevHook = $env:_TIRITH_HOOK
+    $env:_TIRITH_HOOK = '1'
+    try {
+        $approvalPath = & $global:_TIRITH_BIN check --approval-check --non-interactive --interactive --shell powershell -- $line 2>$errfile
+        $rc = $LASTEXITCODE
+    } finally {
+        if ($null -eq $prevHook) { Remove-Item Env:\_TIRITH_HOOK -ErrorAction SilentlyContinue } else { $env:_TIRITH_HOOK = $prevHook }
+    }
     $output = Get-Content $errfile -Raw -ErrorAction SilentlyContinue
     Remove-Item $errfile -Force -ErrorAction SilentlyContinue
 
@@ -279,15 +335,6 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
 
 # Override Ctrl+V for paste interception
 Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
-    # Honor TIRITH=0 bypass (#30): skip paste scanning
-    if ($env:TIRITH -eq "0") {
-        $content = Get-Clipboard -ErrorAction SilentlyContinue
-        if (-not [string]::IsNullOrEmpty($content)) {
-            [Microsoft.PowerShell.PSConsoleReadLine]::Insert($content)
-        }
-        return
-    }
-
     # Get clipboard content
     $pasted = Get-Clipboard -ErrorAction SilentlyContinue
 
@@ -297,8 +344,14 @@ Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
 
     # Check with tirith paste, use temp file to prevent output leakage
     $tmpfile = [System.IO.Path]::GetTempFileName()
-    $pasted | & tirith paste --shell powershell --interactive > $tmpfile 2>&1
-    $rc = $LASTEXITCODE
+    $prevHook = $env:_TIRITH_HOOK
+    $env:_TIRITH_HOOK = '1'
+    try {
+        $pasted | & $global:_TIRITH_BIN paste --shell powershell --interactive > $tmpfile 2>&1
+        $rc = $LASTEXITCODE
+    } finally {
+        if ($null -eq $prevHook) { Remove-Item Env:\_TIRITH_HOOK -ErrorAction SilentlyContinue } else { $env:_TIRITH_HOOK = $prevHook }
+    }
     $output = Get-Content $tmpfile -Raw -ErrorAction SilentlyContinue
     Remove-Item $tmpfile -Force -ErrorAction SilentlyContinue
 
@@ -317,3 +370,37 @@ Set-PSReadLineKeyHandler -Key Ctrl+v -ScriptBlock {
 
     [Microsoft.PowerShell.PSConsoleReadLine]::Insert($pasted)
 }
+
+# TIRITH_STATUS: a small public contract a user can reference in their prompt
+# function to surface tirith's live protection level (see
+# docs/prompt-status.md). tirith prints NOTHING per-prompt — it only sets the
+# variable; wiring it into a prompt is opt-in. The PowerShell hook overrides
+# the Enter key handler, which can revert a blocked command, so its protection
+# level is `blocks`; there is no runtime-degrade path.
+#
+# Set as a session-scoped `$global:` variable, deliberately NOT `$env:`: a
+# `prompt` function runs in THIS interactive session and reads a `$global:`
+# variable fine, whereas an `$env:` variable is inherited by every child
+# process — and a non-interactive child has no tirith protection, so an
+# inherited status would misrepresent it. The hook above already returned
+# early for a non-interactive session, so this only runs interactively.
+$global:TIRITH_STATUS = 'blocks'
+
+# ── tirith output wrap (M7 ch1) ─────────────────────────────────────────────
+# Opt-in output-direction wrapper. Commented out by default in this embedded
+# hook copy; `tirith output wrap on` writes an active copy of the function
+# into the user's shell-profile separately. This block is kept here as the
+# canonical source so a user reading the hook understands the surface area.
+#
+# Scope honesty: this wraps INDIVIDUAL commands invoked via `tirith-out
+# <cmd>`. It does NOT intercept output from anything run outside the wrapper.
+#
+# function tirith-output-guard-wrap {
+#     param([Parameter(ValueFromRemainingArguments=$true)]$Args)
+#     if ($Args.Count -eq 0) {
+#         Write-Error 'tirith-output-guard-wrap: usage: tirith-out <cmd> [args...]'
+#         return
+#     }
+#     & $Args[0] $Args[1..($Args.Count-1)] 2>&1 | & tirith view --max-bytes 16777216 -
+# }
+# Set-Alias tirith-out tirith-output-guard-wrap

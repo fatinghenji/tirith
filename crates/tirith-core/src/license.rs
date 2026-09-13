@@ -37,15 +37,11 @@ impl std::fmt::Display for Tier {
     }
 }
 
-// ─── Enforcement mode ───────────────────────────────────────────────
-
 /// Controls whether unsigned (legacy) tokens are accepted.
-///
-/// - `Legacy`: both signed and unsigned accepted (development/testing)
-/// - `SignedPreferred`: both accepted, but `tirith doctor` warns on unsigned (v0.2.x transition)
-/// - `SignedOnly`: unsigned tokens rejected → Community (v0.3.0+ paid release)
+/// `Legacy`: both accepted (dev/testing). `SignedPreferred`: both accepted, but
+/// `tirith doctor` warns on unsigned (v0.2.x). `SignedOnly`: unsigned rejected (v0.3.0+).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // All variants used in tests; Legacy/SignedOnly used in future releases
+#[allow(dead_code)]
 enum EnforcementMode {
     Legacy,
     SignedPreferred,
@@ -54,16 +50,14 @@ enum EnforcementMode {
 
 const ENFORCEMENT_MODE: EnforcementMode = EnforcementMode::SignedOnly;
 
-// ─── Keyring (Ed25519 public keys) ─────────────────────────────────
-
 struct KeyEntry {
     kid: &'static str,
     key: [u8; 32],
 }
 
-// To rotate keys: generate a new Ed25519 keypair offline, add the public key
-// here as a new KeyEntry with the next kid ("k2", etc.), and store the private
-// key in your secret manager. See docs/threat-model.md for details.
+// Key rotation: generate a new Ed25519 keypair offline, append it here with
+// the next kid, and stash the private key in your secret manager. See
+// docs/threat-model.md for details.
 const KEYRING: &[KeyEntry] = &[
     KeyEntry {
         kid: "k1",
@@ -81,13 +75,14 @@ const KEYRING: &[KeyEntry] = &[
     },
 ];
 
-// Compile-time: keyring must never be empty.
+// A build-time guard: the compiled keyring must never be empty. Clippy sees the
+// current literal is non-empty (`const_is_empty`), but the assert exists to fail
+// the build if someone later edits KEYRING down to nothing.
+#[allow(clippy::const_is_empty)]
 const _: () = assert!(!KEYRING.is_empty());
 
-/// Maximum token length before any parsing (DoS resistance).
+/// Maximum token length accepted before any parsing — DoS guard.
 const MAX_TOKEN_LEN: usize = 8192;
-
-// ─── Shared helpers ─────────────────────────────────────────────────
 
 /// Extract tier from a parsed JSON payload.
 fn tier_from_payload(payload: &serde_json::Value) -> Option<Tier> {
@@ -122,8 +117,8 @@ fn license_info_from_payload(payload: &serde_json::Value, tier: Tier) -> License
             }
         });
 
-    // For legacy tokens, exp is ISO 8601 string. For signed, it's a Unix timestamp.
-    // Store as string either way for display purposes.
+    // Legacy tokens store `exp` as ISO 8601, signed tokens as Unix timestamp.
+    // Normalize to string for display.
     let expires = payload.get("exp").and_then(|v| {
         v.as_str()
             .map(|s| s.to_string())
@@ -139,15 +134,13 @@ fn license_info_from_payload(payload: &serde_json::Value, tier: Tier) -> License
     }
 }
 
-// ─── Legacy (unsigned) token decoding ───────────────────────────────
-
 /// Decode a legacy unsigned base64 JSON payload, checking expiry against `now`.
 fn decode_legacy_payload(key: &str, now: DateTime<Utc>) -> Option<serde_json::Value> {
     use base64::Engine;
 
     let trimmed = key.trim();
 
-    // Size gate (same as signed path — DoS resistance)
+    // Same DoS size gate as the signed path.
     if trimmed.len() > MAX_TOKEN_LEN {
         return None;
     }
@@ -159,7 +152,7 @@ fn decode_legacy_payload(key: &str, now: DateTime<Utc>) -> Option<serde_json::Va
 
     let payload: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
 
-    // Check expiry (ISO 8601 date string, inclusive — valid on exp date)
+    // Legacy `exp` is an ISO 8601 date; comparison is inclusive (valid on the exp date).
     match payload.get("exp").and_then(|v| v.as_str()) {
         Some(exp_str) => match chrono::NaiveDate::parse_from_str(exp_str, "%Y-%m-%d") {
             Ok(exp_date) => {
@@ -176,7 +169,7 @@ fn decode_legacy_payload(key: &str, now: DateTime<Utc>) -> Option<serde_json::Va
             }
         },
         None => {
-            // Missing exp: reject — all tokens must have an expiration date
+            // All tokens must carry an expiration date.
             return None;
         }
     }
@@ -188,7 +181,7 @@ fn decode_legacy_payload(key: &str, now: DateTime<Utc>) -> Option<serde_json::Va
 fn decode_tier_legacy(key: &str, now: DateTime<Utc>) -> Option<Tier> {
     let payload = decode_legacy_payload(key, now)?;
     let tier = tier_from_payload(&payload)?;
-    // Unsigned tokens capped at Pro — Team/Enterprise require signed tokens
+    // Unsigned tokens are capped at Pro; Team/Enterprise require signed tokens.
     Some(match tier {
         Tier::Team | Tier::Enterprise => Tier::Pro,
         other => other,
@@ -199,15 +192,13 @@ fn decode_tier_legacy(key: &str, now: DateTime<Utc>) -> Option<Tier> {
 fn decode_license_info_legacy(key: &str, now: DateTime<Utc>) -> Option<LicenseInfo> {
     let payload = decode_legacy_payload(key, now)?;
     let tier = tier_from_payload(&payload)?;
-    // Unsigned tokens capped at Pro
+    // Unsigned tokens are capped at Pro.
     let tier = match tier {
         Tier::Team | Tier::Enterprise => Tier::Pro,
         other => other,
     };
     Some(license_info_from_payload(&payload, tier))
 }
-
-// ─── Signed token decoding (Ed25519) ────────────────────────────────
 
 /// Decode and verify a signed token: `base64url(payload_json).base64url(ed25519_sig)`.
 ///
@@ -220,47 +211,40 @@ fn decode_signed_token(
     use base64::Engine;
     use ed25519_dalek::{Signature, VerifyingKey};
 
-    // Trim for parity with legacy path
     let token = token.trim();
 
-    // Size gate (before any parsing)
     if token.len() > MAX_TOKEN_LEN {
         return None;
     }
 
-    // Split into exactly two segments
     let (payload_b64, sig_b64) = token.split_once('.')?;
     if payload_b64.is_empty() || sig_b64.is_empty() || sig_b64.contains('.') {
         return None;
     }
 
-    // Decode payload bytes (base64url, with or without padding)
+    // base64url, with or without padding.
     let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload_b64)
         .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload_b64))
         .ok()?;
 
-    // Decode signature bytes
     let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(sig_b64)
         .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(sig_b64))
         .ok()?;
     let signature = Signature::from_slice(&sig_bytes).ok()?;
 
-    // Parse payload to get kid for key lookup
     let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
 
-    // Key lookup: kid present → find in keyring; absent → try all
+    // With kid: look up a specific key. Without kid: try every key; first hit wins.
     let kid = payload.get("kid").and_then(|v| v.as_str());
     let verified = if let Some(kid_val) = kid {
-        // Specific key requested
         let entry = keyring.iter().find(|e| e.kid == kid_val)?;
         let vk = VerifyingKey::from_bytes(&entry.key).ok()?;
         vk.verify_strict(&payload_bytes, &signature)
             .ok()
             .map(|_| ())
     } else {
-        // No kid — try all keys, first success wins
         keyring.iter().find_map(|entry| {
             let vk = VerifyingKey::from_bytes(&entry.key).ok()?;
             vk.verify_strict(&payload_bytes, &signature).ok()
@@ -268,30 +252,28 @@ fn decode_signed_token(
     };
     verified?;
 
-    // Validate issuer
     if payload.get("iss").and_then(|v| v.as_str()) != Some("tirith.dev") {
         return None;
     }
 
-    // Validate audience
     if payload.get("aud").and_then(|v| v.as_str()) != Some("tirith-cli") {
         return None;
     }
 
-    // Validate exp (required for signed tokens, must be i64 Unix timestamp)
-    let exp = match payload.get("exp") {
-        Some(v) => v.as_i64()?, // Wrong type (not i64) → None
-        None => return None,
+    // exp is required on signed tokens and must be an i64 Unix timestamp.
+    // Wrong type → None (fail-closed), and comparison is exclusive.
+    let exp = {
+        let v = payload.get("exp")?;
+        v.as_i64()?
     };
-    // Exclusive: expired when now >= exp
     if now.timestamp() >= exp {
         return None;
     }
 
-    // Validate nbf (optional, but fail-closed on wrong type)
+    // nbf is optional; if present, it must be i64 (fail-closed on wrong type)
+    // and the comparison is inclusive.
     if let Some(nbf_val) = payload.get("nbf") {
-        let nbf = nbf_val.as_i64()?; // Present but wrong type → None (fail-closed)
-                                     // Inclusive: valid when now >= nbf
+        let nbf = nbf_val.as_i64()?;
         if now.timestamp() < nbf {
             return None;
         }
@@ -300,13 +282,9 @@ fn decode_signed_token(
     Some(payload)
 }
 
-// ─── Dispatch (mode-aware) ──────────────────────────────────────────
-
-/// Core dispatch: try signed first (if `.` present), then legacy based on mode.
-///
-/// Note: dispatch is one-way routing — a dot means signed format. In
-/// `SignedPreferred` mode, if a dot-containing token fails signed verification,
-/// we do NOT fall back to legacy (a dot is never valid legacy base64).
+/// Core dispatch: a `.` routes one-way to the signed path (never falling back to
+/// legacy on failure — a dot is never valid legacy base64); otherwise legacy,
+/// subject to `mode`.
 fn decode_tier_at_with_mode(
     key: &str,
     now: DateTime<Utc>,
@@ -314,12 +292,10 @@ fn decode_tier_at_with_mode(
     keyring: &[KeyEntry],
 ) -> Option<Tier> {
     if key.contains('.') {
-        // Dot present → signed format (no fallback to legacy — dot is invalid in standard base64)
         let payload = decode_signed_token(key, keyring, now)?;
         return tier_from_payload(&payload);
     }
 
-    // No dot → legacy format
     if mode == EnforcementMode::SignedOnly {
         return None;
     }
@@ -345,8 +321,6 @@ fn decode_license_info_at_with_mode(
     decode_license_info_legacy(key, now)
 }
 
-// ─── Clock-injectable wrappers ──────────────────────────────────────
-
 /// Decode tier at a specific time (uses compile-time ENFORCEMENT_MODE and KEYRING).
 fn decode_tier_at(key: &str, now: DateTime<Utc>) -> Option<Tier> {
     decode_tier_at_with_mode(key, now, ENFORCEMENT_MODE, KEYRING)
@@ -357,22 +331,13 @@ fn decode_license_info_at(key: &str, now: DateTime<Utc>) -> Option<LicenseInfo> 
     decode_license_info_at_with_mode(key, now, ENFORCEMENT_MODE, KEYRING)
 }
 
-// ─── Public API (unchanged signatures) ──────────────────────────────
-
 /// Determine the current license tier.
 ///
-/// Resolution order:
-/// 1. `TIRITH_LICENSE` env var (raw key)
-/// 2. `~/.config/tirith/license.key` file
-/// 3. Fallback: `Tier::Pro`
-///
-/// Tier verification uses Ed25519-signed tokens. Legacy unsigned tokens are
-/// accepted during the transition period (v0.2.x) but will be rejected in
-/// v0.3.0+. Runtime feature gating has been collapsed to an always-on Pro
-/// baseline; tier parsing remains for compatibility with existing tokens.
-///
-/// Invalid, expired, or missing keys silently fall back to Pro
-/// (no panic, no error exit).
+/// Resolution order: `TIRITH_LICENSE` env var, then `~/.config/tirith/license.key`,
+/// then `Tier::Pro`. Verification uses Ed25519-signed tokens. Invalid, expired,
+/// or missing keys silently fall back to Pro (no panic, no error exit). Runtime
+/// feature gating is collapsed to an always-on Pro baseline; tier parsing
+/// remains for token compatibility.
 pub fn current_tier() -> Tier {
     match read_license_key() {
         Some(k) => decode_tier_at(&k, Utc::now()).unwrap_or_else(|| {
@@ -398,31 +363,23 @@ pub fn license_info() -> LicenseInfo {
     }
 }
 
-// ─── Key format diagnostics (for tirith doctor) ─────────────────────
-
-/// Reports the structural format of the installed license key.
-/// Does NOT verify signatures or validate claims — this is a
-/// lightweight structural check for `tirith doctor` diagnostics.
+/// Structural format of the installed license key. Lightweight check only — does
+/// NOT verify signatures or claims. For `tirith doctor` diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyFormatStatus {
     NoKey,
-    /// No `.` separator, valid base64, decodes to JSON with "tier" field.
+    /// No `.`, valid base64, decodes to JSON with a "tier" field.
     LegacyUnsigned,
-    /// No `.` separator, not valid base64 or missing "tier" field.
+    /// No `.`, not valid base64 or missing "tier".
     LegacyInvalid,
-    /// Has exactly one `.` with two non-empty base64url segments.
-    /// Signature/claims may still be invalid — this is structural only.
+    /// One `.`, two non-empty base64url segments. Signature/claims NOT verified.
     SignedStructural,
-    /// Has `.` but structure is wrong (empty segments, multiple dots).
+    /// Has `.` but malformed (empty segments, multiple dots).
     Malformed,
 }
 
-/// Check the structural format of the installed license key.
-///
-/// NOTE: `SignedStructural` only means the token has the right shape
-/// (two non-empty base64url segments separated by a dot). The signature,
-/// claims (iss, aud, exp), and key validity are NOT verified here.
-/// Use `current_tier()` for full verification.
+/// Check the structural format only — `SignedStructural` means the shape is
+/// right, NOT that signature/claims/key are valid. Use `current_tier()` for that.
 pub fn key_format_status() -> KeyFormatStatus {
     use base64::Engine;
     match read_license_key() {
@@ -430,7 +387,6 @@ pub fn key_format_status() -> KeyFormatStatus {
         Some(k) => {
             let trimmed = k.trim();
             if let Some((left, right)) = trimmed.split_once('.') {
-                // Signed format: exactly one dot, both segments non-empty and valid base64url
                 if left.is_empty() || right.is_empty() || right.contains('.') {
                     return KeyFormatStatus::Malformed;
                 }
@@ -446,7 +402,7 @@ pub fn key_format_status() -> KeyFormatStatus {
                     KeyFormatStatus::Malformed
                 }
             } else {
-                // Legacy: must be valid base64 AND decode to valid JSON with "tier" field
+                // Legacy: valid base64 AND JSON carrying a "tier" field.
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(trimmed)
                     .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(trimmed));
@@ -469,11 +425,8 @@ pub fn key_format_status() -> KeyFormatStatus {
     }
 }
 
-// ─── Internal helpers ───────────────────────────────────────────────
-
-/// Read the raw license key string from env or file.
+/// Read the raw license key string from env or config file.
 fn read_license_key() -> Option<String> {
-    // 1. Environment variable
     if let Ok(val) = std::env::var("TIRITH_LICENSE") {
         let trimmed = val.trim().to_string();
         if !trimmed.is_empty() {
@@ -481,7 +434,6 @@ fn read_license_key() -> Option<String> {
         }
     }
 
-    // 2. Config file
     let path = license_key_path()?;
     match std::fs::read_to_string(&path) {
         Ok(content) => {
@@ -547,7 +499,7 @@ pub fn refresh_from_server(server_url: &str, api_key: &str) -> Result<String, St
         .map_err(|reason| format!("invalid server URL: {reason}"))?;
 
     let url = format!("{}/api/license/refresh", server_url.trim_end_matches('/'));
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::ssrf_guard::server_client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("HTTP client error: {e}"))?;
@@ -558,16 +510,34 @@ pub fn refresh_from_server(server_url: &str, api_key: &str) -> Result<String, St
         .map_err(|e| format!("Request failed: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().unwrap_or_default();
-        return match status.as_u16() {
-            401 | 403 => Err("Authentication failed. Check your API key.".to_string()),
-            402 => Err("Subscription inactive. Renew at https://tirith.dev/account".to_string()),
-            _ => Err(format!("Server returned {status}: {body}")),
-        };
+        // The response body is controlled by the remote server (and by any
+        // compromised intermediary). Never copy it into a terminal-facing
+        // error: it may contain secrets, multiline spoofing, or control
+        // sequences. Status-specific text below is entirely local.
+        return Err(refresh_status_error(status));
     }
-    let token = resp
-        .text()
+    // repo-0289: bound the body BEFORE materializing it. The timeout limits
+    // duration, not bytes; a malicious server could otherwise stream an
+    // unbounded body into memory. A license token is a few KiB, so 64 KiB is
+    // generous headroom.
+    const MAX_REFRESH_BODY: u64 = 64 * 1024;
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_REFRESH_BODY)
+    {
+        return Err("Server response too large".to_string());
+    }
+    let mut body = Vec::new();
+    use std::io::Read as _;
+    let mut limited = std::io::Read::take(resp, MAX_REFRESH_BODY + 1);
+    limited
+        .read_to_end(&mut body)
         .map_err(|e| format!("Failed to read response: {e}"))?;
+    if body.len() as u64 > MAX_REFRESH_BODY {
+        return Err("Server response too large".to_string());
+    }
+    let token =
+        String::from_utf8(body).map_err(|_| "Server response was not valid UTF-8".to_string())?;
     let trimmed = token.trim().to_string();
     if trimmed.is_empty() {
         return Err("Server returned empty token".to_string());
@@ -575,20 +545,42 @@ pub fn refresh_from_server(server_url: &str, api_key: &str) -> Result<String, St
     Ok(trimmed)
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────
+#[cfg(unix)]
+fn refresh_status_error(status: reqwest::StatusCode) -> String {
+    match status.as_u16() {
+        401 | 403 => "Authentication failed. Check your API key.".to_string(),
+        402 => "Subscription inactive. Renew at https://tirith.dev/account".to_string(),
+        code => format!("Server returned HTTP status {code}"),
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
-
-    // ── Test helpers ────────────────────────────────────────────────
+    use tirith_test_support::GlobalStateGuard;
 
     fn test_keypair() -> (SigningKey, [u8; 32]) {
         let sk = SigningKey::generate(&mut OsRng);
         let pk_bytes = sk.verifying_key().to_bytes();
         (sk, pk_bytes)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_errors_never_include_remote_response_content() {
+        // Only the numeric status enters the generic message. A hostile body is
+        // deliberately not an input to this formatter and therefore cannot be
+        // echoed to the terminal by the refresh path.
+        assert_eq!(
+            refresh_status_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+            "Server returned HTTP status 500"
+        );
+        assert_eq!(
+            refresh_status_error(reqwest::StatusCode::UNAUTHORIZED),
+            "Authentication failed. Check your API key."
+        );
     }
 
     fn test_keyring(pk: [u8; 32]) -> Vec<KeyEntry> {
@@ -618,20 +610,16 @@ mod tests {
     }
 
     fn future_ts() -> i64 {
-        // 2099-01-01 00:00:00 UTC
-        4070908800
+        4070908800 // 2099-01-01 00:00:00 UTC
     }
 
     fn past_ts() -> i64 {
-        // 2020-01-01 00:00:00 UTC
-        1577836800
+        1577836800 // 2020-01-01 00:00:00 UTC
     }
 
     fn now() -> DateTime<Utc> {
         Utc::now()
     }
-
-    // ── Legacy helpers (for existing tests) ─────────────────────────
 
     fn make_key(tier: &str, exp: &str) -> String {
         use base64::Engine;
@@ -653,8 +641,6 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(json.as_bytes())
     }
 
-    // ── Original tests (unchanged behavior) ─────────────────────────
-
     #[test]
     fn test_decode_pro() {
         let key = make_key("pro", "2099-12-31");
@@ -666,7 +652,7 @@ mod tests {
 
     #[test]
     fn test_decode_team() {
-        // Legacy unsigned tokens capped at Pro (M1 fix)
+        // Legacy unsigned tokens are capped at Pro.
         let key = make_key("team", "2099-12-31");
         assert_eq!(
             decode_tier_at_with_mode(&key, now(), EnforcementMode::Legacy, KEYRING),
@@ -676,7 +662,7 @@ mod tests {
 
     #[test]
     fn test_decode_enterprise() {
-        // Legacy unsigned tokens capped at Pro (M1 fix)
+        // Legacy unsigned tokens are capped at Pro.
         let key = make_key("enterprise", "2099-12-31");
         assert_eq!(
             decode_tier_at_with_mode(&key, now(), EnforcementMode::Legacy, KEYRING),
@@ -695,7 +681,7 @@ mod tests {
 
     #[test]
     fn test_decode_no_expiry() {
-        // Legacy tokens without exp are now rejected (L4 fix)
+        // Tokens without `exp` are rejected.
         let key = make_key_no_exp("pro");
         assert_eq!(
             decode_tier_at_with_mode(&key, now(), EnforcementMode::Legacy, KEYRING),
@@ -772,7 +758,7 @@ mod tests {
 
     #[test]
     fn test_decode_license_info_team_sso() {
-        // Legacy unsigned tokens capped at Pro (M1 fix)
+        // Legacy unsigned tokens are capped at Pro.
         let key = make_team_sso_key("org-acme-123", "okta");
         let info = decode_license_info_at_with_mode(&key, now(), EnforcementMode::Legacy, KEYRING)
             .unwrap();
@@ -815,8 +801,6 @@ mod tests {
         assert_eq!(info.tier, Tier::Pro);
         assert!(info.org_id.is_none());
     }
-
-    // ── Signed token: happy path ────────────────────────────────────
 
     #[test]
     fn test_signed_pro() {
@@ -862,13 +846,11 @@ mod tests {
         );
     }
 
-    // ── Signed token: signature verification ────────────────────────
-
     #[test]
     fn test_signed_wrong_key() {
         let (sk, _pk) = test_keypair();
         let (_sk2, pk2) = test_keypair();
-        let kr = test_keyring(pk2); // Wrong key in keyring
+        let kr = test_keyring(pk2); // Wrong key in keyring.
         let token = make_signed_token(&make_payload("pro", future_ts()), &sk);
         assert_eq!(
             decode_tier_at_with_mode(&token, now(), EnforcementMode::SignedPreferred, &kr),
@@ -881,7 +863,7 @@ mod tests {
         let (sk, pk) = test_keypair();
         let kr = test_keyring(pk);
         let token = make_signed_token(&make_payload("pro", future_ts()), &sk);
-        // Tamper: change first char of payload segment
+        // Flip the first char of the payload segment.
         let mut chars: Vec<char> = token.chars().collect();
         chars[0] = if chars[0] == 'a' { 'b' } else { 'a' };
         let tampered: String = chars.into_iter().collect();
@@ -898,7 +880,7 @@ mod tests {
         let kr = test_keyring(pk);
         let token = make_signed_token(&make_payload("pro", future_ts()), &sk);
         let (payload_part, _sig_part) = token.split_once('.').unwrap();
-        // Replace signature with garbage
+        // Replace the signature with zero bytes.
         let bad_sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 64]);
         let tampered = format!("{payload_part}.{bad_sig}");
         assert_eq!(
@@ -906,8 +888,6 @@ mod tests {
             None
         );
     }
-
-    // ── Signed token: claims validation ─────────────────────────────
 
     #[test]
     fn test_signed_wrong_iss() {
@@ -966,7 +946,8 @@ mod tests {
     fn test_signed_nbf_future() {
         let (sk, pk) = test_keypair();
         let kr = test_keyring(pk);
-        let far_future_nbf = future_ts() - 1000; // Still in the far future relative to now
+        // Still in the far future relative to now.
+        let far_future_nbf = future_ts() - 1000;
         let payload = format!(
             r#"{{"iss":"tirith.dev","aud":"tirith-cli","kid":"k1","tier":"pro","exp":{},"nbf":{}}}"#,
             future_ts(),
@@ -978,8 +959,6 @@ mod tests {
             None
         );
     }
-
-    // ── Signed token: legacy compat ─────────────────────────────────
 
     #[test]
     fn test_legacy_works_in_signed_preferred() {
@@ -998,8 +977,6 @@ mod tests {
             None
         );
     }
-
-    // ── Signed token: license info ──────────────────────────────────
 
     #[test]
     fn test_signed_license_info_full() {
@@ -1031,8 +1008,6 @@ mod tests {
         .is_none());
     }
 
-    // ── Key rotation (kid) ──────────────────────────────────────────
-
     #[test]
     fn test_kid_correct() {
         let (sk, pk) = test_keypair();
@@ -1048,7 +1023,7 @@ mod tests {
     fn test_kid_mismatch() {
         let (sk, pk) = test_keypair();
         let kr = test_keyring(pk);
-        // Use kid "k99" which is not in the keyring
+        // "k99" is not in the test keyring.
         let payload = format!(
             r#"{{"iss":"tirith.dev","aud":"tirith-cli","kid":"k99","tier":"pro","exp":{}}}"#,
             future_ts()
@@ -1064,7 +1039,7 @@ mod tests {
     fn test_no_kid_tries_all() {
         let (sk, pk) = test_keypair();
         let kr = test_keyring(pk);
-        // No kid field
+        // No kid field — decoder should try every key in the ring.
         let payload = format!(
             r#"{{"iss":"tirith.dev","aud":"tirith-cli","tier":"pro","exp":{}}}"#,
             future_ts()
@@ -1075,8 +1050,6 @@ mod tests {
             Some(Tier::Pro)
         );
     }
-
-    // ── Parser hardening ────────────────────────────────────────────
 
     #[test]
     fn test_parser_empty_segment_left() {
@@ -1112,7 +1085,7 @@ mod tests {
     fn test_parser_oversized_token() {
         let (sk, pk) = test_keypair();
         let kr = test_keyring(pk);
-        // Create a valid token then pad it beyond MAX_TOKEN_LEN
+        // Pad a valid token past MAX_TOKEN_LEN to exercise the DoS gate.
         let token = make_signed_token(&make_payload("pro", future_ts()), &sk);
         let oversized = format!("{token}{}", "A".repeat(MAX_TOKEN_LEN));
         assert_eq!(
@@ -1125,7 +1098,7 @@ mod tests {
     fn test_parser_bad_nbf_type() {
         let (sk, pk) = test_keypair();
         let kr = test_keyring(pk);
-        // nbf is a string instead of i64 → fail-closed
+        // nbf as a string (not i64) must fail closed.
         let payload = format!(
             r#"{{"iss":"tirith.dev","aud":"tirith-cli","kid":"k1","tier":"pro","exp":{},"nbf":"not-a-number"}}"#,
             future_ts()
@@ -1151,7 +1124,7 @@ mod tests {
     fn test_parser_exp_exact_boundary() {
         let (sk, pk) = test_keypair();
         let kr = test_keyring(pk);
-        // exp == now → should be expired (exclusive)
+        // exp comparison is exclusive, so exp == now means expired.
         let ts = now().timestamp();
         let token = make_signed_token(&make_payload("pro", ts), &sk);
         assert_eq!(
@@ -1164,7 +1137,7 @@ mod tests {
     fn test_parser_nbf_exact_boundary() {
         let (sk, pk) = test_keypair();
         let kr = test_keyring(pk);
-        // nbf == now → should be valid (inclusive)
+        // nbf comparison is inclusive, so nbf == now is valid.
         let ts = now().timestamp();
         let payload = format!(
             r#"{{"iss":"tirith.dev","aud":"tirith-cli","kid":"k1","tier":"pro","exp":{},"nbf":{}}}"#,
@@ -1195,30 +1168,23 @@ mod tests {
 
     #[test]
     fn test_parser_padded_base64url_structural() {
-        // Padded base64url should still be recognized as SignedStructural by key_format_status
+        // Padded base64url must still parse as SignedStructural.
         use base64::Engine;
         let payload = r#"{"iss":"tirith.dev","aud":"tirith-cli","tier":"pro","exp":9999999999}"#;
         let payload_b64 = base64::engine::general_purpose::URL_SAFE.encode(payload.as_bytes());
         let fake_sig_b64 = base64::engine::general_purpose::URL_SAFE.encode([0u8; 64]);
         let token = format!("{payload_b64}.{fake_sig_b64}");
-        // Contains padding ('='), but should still parse structurally
         assert!(token.contains('='));
 
-        // Thread-safe env-var mutation
-        let _guard = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("TIRITH_LICENSE", &token) };
+        let mut environment = GlobalStateGuard::new().expect("isolate license environment");
+        environment.set_env("TIRITH_LICENSE", &token);
         let status = key_format_status();
-        unsafe { std::env::remove_var("TIRITH_LICENSE") };
         assert_eq!(
             status,
             KeyFormatStatus::SignedStructural,
             "Padded base64url token should be recognized as SignedStructural"
         );
     }
-
-    // ── Enforcement mode ────────────────────────────────────────────
 
     #[test]
     fn test_enforcement_legacy_accepts_unsigned() {
@@ -1238,12 +1204,10 @@ mod tests {
         );
     }
 
-    // ── Keyring invariants ──────────────────────────────────────────
-
     #[test]
     #[allow(clippy::const_is_empty)]
     fn test_keyring_non_empty() {
-        // Also enforced at compile time (line 76), but belt-and-suspenders
+        // Compile-time assert above covers this too, but test it anyway.
         #[allow(clippy::const_is_empty)]
         let not_empty = !KEYRING.is_empty();
         assert!(not_empty);
@@ -1268,10 +1232,10 @@ mod tests {
         }
     }
 
-    // ── CI release guard ────────────────────────────────────────────
-
+    /// Release CI runs this explicitly to make sure the compiled enforcement
+    /// mode matches the release tag's semver expectations.
     #[test]
-    #[ignore] // Only run explicitly during release CI
+    #[ignore]
     fn enforcement_mode_matches_release_tag() {
         let tag = std::env::var("RELEASE_TAG").expect("RELEASE_TAG env var not set");
         let mode = match ENFORCEMENT_MODE {
@@ -1306,7 +1270,7 @@ mod tests {
                 "Release {tag} (v0.2.x) requires SignedPreferred+, found {mode}"
             );
         } else if minor <= 1 {
-            // v0.1.x: Legacy or SignedPreferred acceptable (transition period)
+            // v0.1.x is the transition period: Legacy or SignedPreferred are OK.
             assert!(
                 mode == "Legacy" || mode == "SignedPreferred",
                 "Release {tag} (v0.1.x) should use Legacy or SignedPreferred, found {mode}"
@@ -1314,16 +1278,13 @@ mod tests {
         }
     }
 
-    // ── Key revocation ───────────────────────────────────────────────
-
     #[test]
     fn test_key_revocation_after_removal() {
-        // A token signed with key "k1" must be rejected when k1 is removed from keyring
+        // Removing a key from the keyring must invalidate any token it signed.
         let (sk, pk) = test_keypair();
         let kr_with_key = test_keyring(pk);
         let token = make_signed_token(&make_payload("pro", future_ts()), &sk);
 
-        // Valid with key present
         assert_eq!(
             decode_tier_at_with_mode(
                 &token,
@@ -1334,7 +1295,6 @@ mod tests {
             Some(Tier::Pro)
         );
 
-        // Revoked: empty keyring (key removed)
         let kr_empty: Vec<KeyEntry> = vec![];
         assert_eq!(
             decode_tier_at_with_mode(&token, now(), EnforcementMode::SignedPreferred, &kr_empty),
@@ -1342,8 +1302,6 @@ mod tests {
             "Token must be rejected after signing key is removed from keyring"
         );
     }
-
-    // ── Multi-key keyring ────────────────────────────────────────────
 
     #[test]
     fn test_multi_key_kid_directed_lookup() {
@@ -1360,7 +1318,7 @@ mod tests {
             },
         ];
 
-        // Token signed with k2, kid="k2" → should find k2 directly
+        // kid="k2" signed with sk2 → resolved directly via kid lookup.
         let payload = format!(
             r#"{{"iss":"tirith.dev","aud":"tirith-cli","kid":"k2","tier":"team","exp":{}}}"#,
             future_ts()
@@ -1371,14 +1329,13 @@ mod tests {
             Some(Tier::Team)
         );
 
-        // Token signed with k1, kid="k1" → should find k1
         let token1 = make_signed_token(&make_payload("pro", future_ts()), &sk1);
         assert_eq!(
             decode_tier_at_with_mode(&token1, now(), EnforcementMode::SignedPreferred, &kr),
             Some(Tier::Pro)
         );
 
-        // Token signed with k1 but kid="k2" → wrong key, must reject
+        // kid="k2" but actually signed with sk1 → verification fails, rejected.
         let wrong_kid_payload = format!(
             r#"{{"iss":"tirith.dev","aud":"tirith-cli","kid":"k2","tier":"pro","exp":{}}}"#,
             future_ts()
@@ -1395,8 +1352,6 @@ mod tests {
             "Token signed with k1 but kid=k2 must be rejected"
         );
     }
-
-    // ── Missing claims ───────────────────────────────────────────────
 
     #[test]
     fn test_signed_missing_iss() {
@@ -1434,7 +1389,7 @@ mod tests {
     fn test_signed_exp_as_string_rejected() {
         let (sk, pk) = test_keypair();
         let kr = test_keyring(pk);
-        // exp as ISO string instead of Unix timestamp → must reject
+        // Signed tokens require `exp` as an i64 Unix timestamp, not an ISO string.
         let payload =
             r#"{"iss":"tirith.dev","aud":"tirith-cli","kid":"k1","tier":"pro","exp":"2099-12-31"}"#;
         let token = make_signed_token(payload, &sk);
@@ -1454,8 +1409,6 @@ mod tests {
             None
         );
     }
-
-    // ── Enforcement mode coverage ────────────────────────────────────
 
     #[test]
     fn test_legacy_mode_accepts_signed() {

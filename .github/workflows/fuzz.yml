@@ -1,9 +1,19 @@
 name: Fuzz
 
 on:
+  pull_request:
   schedule:
     - cron: "0 3 * * 1" # Monday 3am UTC
   workflow_dispatch:
+  workflow_call:
+
+# Replace only superseded PR checks. Other events get a unique run group so
+# neither running nor pending scheduled, dispatched, or release-gate work is
+# replaced. The file-specific prefix also separates this reusable workflow
+# from its Release caller, whose github.workflow value it inherits.
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -23,24 +33,45 @@ jobs:
           - extractor
           - normalizer
           - byte_scanner
+          - artifact_wheel
+          - lexical_path
+          - npm_command
+          - task_envelope
+          - web3_command
+          - workflow_artifact
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: nightly-2026-06-01
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Preflight locked fuzz dependencies
+        run: |
+          git ls-files --error-unmatch fuzz/Cargo.lock
+          cargo +nightly fetch --manifest-path fuzz/Cargo.toml --locked
+          git diff --exit-code -- fuzz/Cargo.lock
 
       - name: Run fuzzer
         run: |
           cd fuzz
           cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300
         env:
+          CARGO_NET_OFFLINE: "true"
           RUSTFLAGS: "-C debuginfo=0"
+
+      - name: Verify fuzz lockfile is unchanged
+        if: always()
+        run: git diff --exit-code -- fuzz/Cargo.lock
 
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-crash-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}/
